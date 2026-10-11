@@ -29,3 +29,10 @@ Record unverified physical behavior separately. Keep private accounts, fixture
 media, raw captures and receipts outside Git. Open reviewable feature PRs as
 work completes; remaining roadmap items are not complete merely because G1–G3
 pass.
+
+After G1-G6 are complete and verified, continue with remaining backlog items,
+starting with the easiest. Recheck console availability before every native
+case; another running title always takes priority.
+
+- 2026-10-11 | G5 | channel organization | host | partial-pass: 167 sanitized UI tests, 5692 renderer frames; names/hiding/order persist | native idle-console check pending
+- 2026-10-11 | G4-G6 | integrated features | host | partial-pass: 188 UI, 129 core, 34 media, 50 tooling tests passed | console .30 occupied; native build and remaining browsing in progress

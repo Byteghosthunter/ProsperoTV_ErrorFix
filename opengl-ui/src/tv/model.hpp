@@ -17,6 +17,7 @@
 #include "tv/channel_text.hpp"
 #include "tv/library.hpp"
 #include "tv/guide.hpp"
+#include "tv/recording.hpp"
 #include "tv/portal.hpp"
 #include "tv/vod.hpp"
 #include "tv/parental.hpp"
@@ -47,6 +48,9 @@ struct PlayRequest
     bool reconnect_live = false;
     bool live = false;
     bool record_channel_result = true;
+    bool on_demand = false;
+    std::uint64_t start_position_us = 0;
+    std::string series_id;
     PortalCredentials portal;
     std::string portal_command;
 };
@@ -60,6 +64,8 @@ enum class Group : std::uint8_t
     news,
     sports,
     kids,
+    recently_added,
+    most_watched,
     count,
 };
 inline constexpr unsigned kGroupCount = static_cast<unsigned>(Group::count);
@@ -219,7 +225,45 @@ class Model
     {
         return vod_;
     }
+    struct SearchResult
+    {
+        enum class Kind
+        {
+            channel,
+            movie,
+            show,
+            programme
+        };
+        Kind kind = Kind::channel;
+        std::string id, title, detail;
+        std::int64_t programme_start = 0;
+        std::uint64_t source_id = 0;
+    };
+    void begin_search();
+    void end_search();
+    bool searching() const
+    {
+        return searching_;
+    }
+    std::vector<SearchResult> search_results(std::string_view query,
+                                             bool *truncated = nullptr) const;
+    std::string search_status() const;
+    unsigned search_revision() const
+    {
+        return search_movies_.revision() + search_shows_.revision();
+    }
+    bool activate_search_vod(const SearchResult &result);
+    bool channel_visible(unsigned index) const;
+    bool search_loading() const
+    {
+        return search_busy() || search_pending();
+    }
+    bool search_vod_allowed(const iptv::ChannelView &item) const;
     bool play_vod(unsigned index);
+    bool save_vod_progress(std::string_view id, std::uint64_t position_us,
+                           std::uint64_t duration_us);
+    bool finish_vod(const PlayRequest &request, std::uint64_t position_us,
+                    std::uint64_t duration_us, bool completed);
     bool ask_vod_query();
 
     // ---- the catalog ----
@@ -235,8 +279,16 @@ class Model
     // the catalog's own, and a download replaces the catalog).
     iptv::ChannelView channel(unsigned index) const
     {
-        return catalog_[index];
+        auto value = catalog_[index];
+        if (const auto name = channel_names_.find(value.id); name != channel_names_.end())
+            value.name = name->second;
+        return value;
     }
+    bool rename_channel(std::string_view id, std::string_view name);
+    bool hide_channel(std::string_view id, bool hidden);
+    std::vector<unsigned> hidden_channels() const;
+    bool move_channel(std::string_view id, int direction);
+    bool reset_channel_order();
     // The channels the group, the search and the filters leave, in the order
     // of the alphabet (see sort_key).
     unsigned visible_count() const
@@ -266,15 +318,19 @@ class Model
     {
         return catalog_index < index_.ranks.size() ? index_.ranks[catalog_index] + 1u : 0u;
     }
+    std::string number_label(unsigned catalog_index) const;
+    // Only the visible list can be reached. -1 means missing; -2 means ambiguous.
+    int position_for_number(std::string_view number) const;
     // The scripts the list's names and groups are written in beyond the
     // European ones: the faces for them are large, and loaded only when asked for.
     bool uses_east_asian() const
     {
-        return index_.east_asian || vod_.east_asian();
+        return index_.east_asian || vod_.east_asian() || search_movies_.east_asian() ||
+               search_shows_.east_asian();
     }
     bool uses_korean() const
     {
-        return index_.korean || vod_.korean();
+        return index_.korean || vod_.korean() || search_movies_.korean() || search_shows_.korean();
     }
     // Changes whenever the visible list may have changed.
     unsigned revision() const
@@ -358,6 +414,31 @@ class Model
     // never a hidden or parent-blocked channel.
     std::optional<unsigned> previous_channel(std::string_view current) const;
     bool play_programme(unsigned catalog_index, const Programme &programme);
+    bool schedule_programme(unsigned index, const Programme &programme, bool record);
+    void poll_programme_jobs();
+    void toggle_recording(std::string_view channel);
+    void cancel_programme_job(std::int64_t id);
+    std::vector<ProgrammeJob> programme_jobs() const
+    {
+        if (!parental_.valid() || parental_.kids_only() ||
+            (parental_.enabled() && !parental_.unlocked()))
+            return {};
+        return programme_jobs_.list();
+    }
+    const std::string &programme_notice() const
+    {
+        return programme_notice_;
+    }
+    std::string take_programme_notice()
+    {
+        std::string notice;
+        notice.swap(programme_notice_);
+        return notice;
+    }
+    bool recording() const
+    {
+        return recorder_.active();
+    }
     const Guide &guide() const
     {
         return guide_;
@@ -375,6 +456,7 @@ class Model
     // The focused live channel without changing history or playback health.
     std::optional<PlayRequest> preview_request(std::string_view channel_id) const;
     // Called when the menu reopens after a channel that would not play.
+    void report_watch(std::string_view channel_id);
     void report_playback_failure(const char *channel_id, const char *channel_name, int result,
                                  unsigned attempts, const char *detail);
     const PlaybackFailure *failure() const
@@ -548,12 +630,20 @@ class Model
     bool opened_once_ = false;
     bool keyboard_ready_ = false;
     Library library_;
+    ProgrammeJobs programme_jobs_;
+    Recorder recorder_;
+    std::int64_t recording_job_ = 0;
+    std::uint64_t next_job_check_ = 0;
+    std::string programme_notice_;
     std::vector<SavedSource> sources_;
     std::int64_t selected_source_id_ = 1;
     std::int64_t editing_source_id_ = 2;
     RefreshSchedule schedule_ = RefreshSchedule::daily;
     std::uint64_t next_schedule_check_ = 0;
     std::unordered_set<std::string> hidden_categories_;
+    std::unordered_set<std::string> hidden_channels_;
+    std::map<std::string, std::string, std::less<>> channel_names_;
+    std::vector<std::string> channel_order_, favorite_order_;
     std::unordered_set<std::string> folder_channels_;
     std::string provider_category_;
     std::string folder_;
@@ -561,6 +651,17 @@ class Model
     bool resume_attempted_ = false;
     Guide guide_, pending_guide_;
     VodLibrary vod_;
+    VodLibrary search_movies_, search_shows_;
+    bool searching_ = false;
+    bool search_busy() const
+    {
+        return search_movies_.busy() || search_shows_.busy();
+    }
+    bool search_pending() const
+    {
+        return searching_ && (search_movies_.requested() || search_shows_.requested());
+    }
+    bool queue_vod(const iptv::ChannelView &item, const std::string &series);
     void *guide_thread_ = nullptr;
     std::atomic<bool> guide_done_{false}, guide_stop_{false};
     std::vector<std::string> guide_urls_;
@@ -576,6 +677,7 @@ class Model
     bool playlist_cache_needs_refresh_ = false;
     std::uint64_t saved_unix_ = 0;
     iptv::UserState user_;
+    std::vector<ChannelHistory> channel_history_;
     std::vector<std::uint8_t> marks_; // by catalog index: a favorite, a recent channel
     std::vector<std::uint32_t> visible_;
     unsigned visible_count_ = 0;

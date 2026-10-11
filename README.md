@@ -127,6 +127,9 @@
 - Choose among the audio tracks a channel carries, and show its subtitles.
 - Pause live TV and go back a few minutes.
 - Set a sleep timer.
+- Record live TV to USB with Touchpad, or schedule a recording or reminder from
+  the guide's Options menu. Keep the app running; recording uses an additional
+  provider connection.
 - Watch two or four live channels side by side in Multiview, with sound
   following the focused one. Four 720p H.264 feeds are validated on hardware;
   higher resolutions depend on the decoder resources available.
@@ -174,7 +177,12 @@
 - Use a full-screen OpenGL interface at up to 4K, built with the
   [ps5-homebrew-ui](https://github.com/blackbearreloaded/ps5-homebrew-ui) kit,
   with fonts for Latin, Greek, Cyrillic, Chinese, Japanese, and Korean channel
-  names, interface sounds, and a Reduce motion setting.
+  names, interface sounds, and a Reduce motion setting. Settings also offers
+  Dusk, Ocean and Forest themes, opaque high-contrast menus, and 25% larger text
+  (applied when the menu next opens). Channel artwork and video retain their colors.
+  A black screensaver protects idle menus and paused video after 1, 5 or 10 minutes;
+  five minutes is the default, and it can be turned off. The first button wakes
+  the screen without activating a control. Active multiview stays visible.
 
 Provider requirements and validation for these features are in
 [the implementation guide](docs/ROADMAP_IMPLEMENTATION.md).
@@ -206,6 +214,8 @@ at 3840×2160. Codec and renderer details are documented in
 | Triangle on a configurable source | Edit the custom M3U URL or Xtream account |
 | Square in Sources | Cycle daily, weekly and manual refresh |
 | Touchpad in Live TV / Favorites | Provider categories / favorite folders |
+| R1 inside categories / folders | Channel number pad: enter a number, then Watch |
+| L1 inside categories / folders | Rename, hide/restore, or move channels in the list |
 | R3 in the channel browser | Open the programme guide |
 | L3 in Live TV / Favorites | Open Multiview; Square chooses a channel, Triangle switches two/four tiles, R3 mutes, Cross opens full screen |
 | Options | Refresh the selected catalog source |
@@ -508,3 +518,30 @@ Copyright © 2026 BlackBearReloaded. Licensed under GPL-3.0-or-later; see [LICEN
 
 This project was developed with AI assistance from OpenAI and/or Anthropic tools.
 <!-- bbr-footer:end -->
+
+Provider channel numbers (`tvg-chno` / `channel-number` in M3U, `num` in Xtream,
+`number` in MAC portals) appear in the channel hero and playback channel list.
+Numbers such as `7.2` and leading zeros are preserved. Channels without a number
+keep their alphabetical position. The number pad searches only the current
+visible list; when numbers repeat, narrow the list before choosing one. Existing
+cached lists acquire provider numbers on their next refresh.
+
+In Live TV or Favorites, focus a channel and open Touchpad, then L1 for channel
+options. Names are saved locally without changing provider IDs, guide matching,
+or parental rules. An empty name or **Use provider name** restores the original.
+**Hidden channels** lets you restore individual channels, including when the
+current list is empty. A hidden provider category must also be shown for its
+channels to appear.
+
+**Move up/down** swaps a channel with its visible neighbor. Live lists share one
+saved order; Favorites and its folders share a separate order. Both survive
+refreshes and restarts; new channels are appended alphabetically. **Reset list
+order** restores alphabetical order for the current kind of list.
+During playback, Options opens the tracks and picture controls. The Picture
+tab offers Fit, Stretch, corrected 4:3 or 16:9, Fill (crop), and 125% or 150%
+zoom. Controls and captions stay within the visible crop. Text subtitles
+have Small/Medium/Large sizes and White/Yellow/Cyan colors; image subtitles
+retain the provider's artwork. These choices are saved for the next video.
+In multiview, Touchpad keeps the selected live channel playing in a corner while you browse lists or the programme guide. L3 in the live list closes picture in picture.
+
+Live TV also offers Recently added (first seen by this app) and Most watched (successful viewing sessions), with history saved separately for each profile and source.

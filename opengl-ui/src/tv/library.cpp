@@ -148,17 +148,31 @@ bool Library::open(const std::string &path)
     }
     constexpr const char *schema =
         "PRAGMA foreign_keys=ON; BEGIN;"
+        "CREATE TABLE IF NOT EXISTS channel_history (source INTEGER NOT NULL, channel TEXT NOT "
+        "NULL, first_seen INTEGER NOT NULL, watches INTEGER NOT NULL DEFAULT 0, PRIMARY "
+        "KEY(source,channel));"
         "CREATE TABLE IF NOT EXISTS sources (id INTEGER PRIMARY KEY,kind INTEGER NOT NULL,"
         "name TEXT NOT NULL,url TEXT NOT NULL,username TEXT NOT NULL,password TEXT NOT NULL,"
         "mac TEXT NOT NULL,schedule INTEGER NOT NULL CHECK(schedule BETWEEN 0 AND 2));"
+        "CREATE TRIGGER IF NOT EXISTS history_source_removed AFTER DELETE ON sources BEGIN "
+        "DELETE FROM channel_history WHERE source=OLD.id; END;"
         "CREATE TABLE IF NOT EXISTS selection (singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
         "source INTEGER REFERENCES sources(id) ON DELETE SET NULL);"
         "CREATE TABLE IF NOT EXISTS last_channel (singleton INTEGER PRIMARY KEY CHECK(singleton=1),"
         "source INTEGER REFERENCES sources(id) ON DELETE SET NULL,channel TEXT NOT NULL);"
         "CREATE TABLE IF NOT EXISTS hidden_categories (source TEXT NOT NULL,category TEXT NOT NULL,"
         "PRIMARY KEY(source,category));"
+        "CREATE TABLE IF NOT EXISTS channel_names (source TEXT NOT NULL,channel TEXT NOT NULL,"
+        "name TEXT NOT NULL,PRIMARY KEY(source,channel));"
+        "CREATE TABLE IF NOT EXISTS channel_order (source TEXT NOT NULL,favorites INTEGER NOT NULL,"
+        "channel TEXT NOT NULL,position INTEGER NOT NULL,PRIMARY KEY(source,favorites,channel));"
+        "CREATE TABLE IF NOT EXISTS hidden_channels (source TEXT NOT NULL,channel TEXT NOT NULL,"
+        "PRIMARY KEY(source,channel));"
         "CREATE TABLE IF NOT EXISTS category_rules (source TEXT NOT NULL,category TEXT NOT NULL,"
         "rule INTEGER NOT NULL CHECK(rule IN(1,2)),PRIMARY KEY(source,category));"
+        "CREATE TABLE IF NOT EXISTS playback_progress (channel TEXT PRIMARY KEY,"
+        "position INTEGER NOT NULL CHECK(position>=0),duration INTEGER NOT NULL "
+        "CHECK(duration>=0));"
         "CREATE TABLE IF NOT EXISTS folders (name TEXT PRIMARY KEY);"
         "CREATE TABLE IF NOT EXISTS folder_channels (folder TEXT NOT NULL REFERENCES folders(name)"
         " ON DELETE CASCADE ON UPDATE CASCADE,channel TEXT NOT NULL,PRIMARY KEY(folder,channel));"
@@ -170,6 +184,91 @@ bool Library::open(const std::string &path)
     }
     db_ = db;
     return true;
+}
+
+std::map<std::string, std::string, std::less<>> Library::channel_names(std::uint64_t source) const
+{
+    std::map<std::string, std::string, std::less<>> result;
+    Statement query(db_, "SELECT channel,name FROM channel_names WHERE source=?1");
+    if (query.text(1, std::to_string(source)))
+        while (query.row())
+        {
+            auto id = query.string(0);
+            auto name = query.string(1);
+            if (valid_text(id, 256) && valid_text(name, 256))
+                result.emplace(std::move(id), std::move(name));
+        }
+    return result;
+}
+
+bool Library::rename_channel(std::uint64_t source, std::string_view channel, std::string_view name)
+{
+    if (!valid_text(channel, 256) || (!name.empty() && !valid_text(name, 256)))
+        return false;
+    Statement query(db_, name.empty()
+                             ? "DELETE FROM channel_names WHERE source=?1 AND channel=?2"
+                             : "INSERT INTO channel_names VALUES(?1,?2,?3) ON "
+                               "CONFLICT(source,channel) DO UPDATE SET name=excluded.name");
+    return query.text(1, std::to_string(source)) && query.text(2, channel) &&
+           (name.empty() || query.text(3, name)) && query.done();
+}
+
+std::unordered_set<std::string> Library::hidden_channels(std::uint64_t source) const
+{
+    std::unordered_set<std::string> result;
+    Statement query(db_, "SELECT channel FROM hidden_channels WHERE source=?1");
+    if (query.text(1, std::to_string(source)))
+        while (query.row())
+        {
+            auto id = query.string(0);
+            if (valid_text(id, 256))
+                result.insert(std::move(id));
+        }
+    return result;
+}
+
+bool Library::hide_channel(std::uint64_t source, std::string_view channel, bool hidden)
+{
+    if (!valid_text(channel, 256))
+        return false;
+    Statement query(db_, hidden ? "INSERT OR IGNORE INTO hidden_channels VALUES(?1,?2)"
+                                : "DELETE FROM hidden_channels WHERE source=?1 AND channel=?2");
+    return query.text(1, std::to_string(source)) && query.text(2, channel) && query.done();
+}
+
+std::vector<std::string> Library::channel_order(std::uint64_t source, bool favorites) const
+{
+    std::vector<std::string> result;
+    Statement query(db_, "SELECT channel FROM channel_order WHERE source=?1 AND favorites=?2 ORDER "
+                         "BY position,channel");
+    if (query.text(1, std::to_string(source)) && query.integer(2, favorites))
+        while (query.row())
+            result.push_back(query.string(0));
+    return result;
+}
+
+bool Library::save_channel_order(std::uint64_t source, bool favorites,
+                                 const std::vector<std::string> &ids)
+{
+    if (!db_ || ids.size() > 250000 ||
+        std::any_of(ids.begin(), ids.end(), [](const auto &id) { return !valid_text(id, 256); }) ||
+        sqlite3_exec(db_, "BEGIN IMMEDIATE", nullptr, nullptr, nullptr) != SQLITE_OK)
+        return false;
+    const auto key = std::to_string(source);
+    Statement clear(db_, "DELETE FROM channel_order WHERE source=?1 AND favorites=?2");
+    bool ok = clear.text(1, key) && clear.integer(2, favorites) && clear.done();
+    Statement row(db_, "INSERT INTO channel_order VALUES(?1,?2,?3,?4)");
+    for (std::size_t i = 0; ok && i < ids.size(); ++i)
+    {
+        ok = row.text(1, key) && row.integer(2, favorites) && row.text(3, ids[i]) &&
+             row.integer(4, static_cast<std::int64_t>(i)) && row.done();
+        if (row.stmt)
+            sqlite3_reset(row.stmt);
+    }
+    if (ok && sqlite3_exec(db_, "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK)
+        return true;
+    sqlite3_exec(db_, "ROLLBACK", nullptr, nullptr, nullptr);
+    return false;
 }
 
 std::vector<SavedSource> Library::sources() const
@@ -225,6 +324,36 @@ std::int64_t Library::selected_source() const
 {
     Statement query(db_, "SELECT source FROM selection WHERE singleton=1");
     return query.row() ? sqlite3_column_int64(query.stmt, 0) : 0;
+}
+
+std::pair<std::uint64_t, std::uint64_t> Library::playback_progress(std::string_view channel) const
+{
+    Statement query(db_, "SELECT position,duration FROM playback_progress WHERE channel=?1");
+    if (!valid_text(channel, 1024) || !query.text(1, channel) || !query.row())
+        return {};
+    const auto position = sqlite3_column_int64(query.stmt, 0);
+    const auto duration = sqlite3_column_int64(query.stmt, 1);
+    if (position < 0 || duration < 0 || position > INT64_MAX / 4 || duration > INT64_MAX / 4 ||
+        (duration && position >= duration))
+        return {};
+    return {static_cast<std::uint64_t>(position), static_cast<std::uint64_t>(duration)};
+}
+
+bool Library::save_playback_progress(std::string_view channel, std::uint64_t position_us,
+                                     std::uint64_t duration_us)
+{
+    if (!valid_text(channel, 1024) || position_us > INT64_MAX / 4 || duration_us > INT64_MAX / 4 ||
+        (duration_us && position_us >= duration_us))
+        return false;
+    if (!position_us)
+    {
+        Statement query(db_, "DELETE FROM playback_progress WHERE channel=?1");
+        return query.text(1, channel) && query.done();
+    }
+    Statement query(db_, "INSERT INTO playback_progress VALUES(?1,?2,?3) ON CONFLICT(channel)"
+                         " DO UPDATE SET position=excluded.position,duration=excluded.duration");
+    return query.text(1, channel) && query.integer(2, position_us) &&
+           query.integer(3, duration_us) && query.done();
 }
 
 bool Library::select_source(std::int64_t id)

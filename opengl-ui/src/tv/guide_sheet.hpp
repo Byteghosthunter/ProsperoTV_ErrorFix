@@ -12,7 +12,7 @@ class GuideSheet
     explicit GuideSheet(Shared &shared) : shared_(shared)
     {
     }
-    void open(std::string_view channel, ui::Feedback &feedback);
+    void open(std::string_view channel, ui::Feedback &feedback, std::int64_t time = 0);
     bool is_open() const
     {
         return open_;
@@ -38,6 +38,8 @@ class GuideSheet
     void keep_in_view();
     Shared &shared_;
     bool open_ = false;
+    bool actions_ = false, jobs_ = false;
+    unsigned action_row_ = 0;
     unsigned row_ = 0, top_ = 0, revision_ = 0;
     std::string channel_;
     std::int64_t time_ = 0, left_ = 0;

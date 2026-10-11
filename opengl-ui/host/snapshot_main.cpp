@@ -69,7 +69,8 @@ bool load_font(hui::gfx::Renderer &renderer, const std::string &path, hui::gfx::
                hui::ui::FontRef *ref)
 {
     std::string data;
-    if (!hui::save::read_file(path, &data, 64u << 20) || !font->load(data))
+    if (!hui::save::read_file(path, &data, 64u << 20) ||
+        !ptv::load_menu_font(std::move(data), *font, std::getenv("TV_LARGER_TEXT") != nullptr))
     {
         std::fprintf(stderr, "cannot load font %s\n", path.c_str());
         return false;
@@ -275,6 +276,22 @@ const Step kWalk[] = {
         },
         2.0f, "46-now-next"),
     press(Action::touch, 0.6f, "47-category-countries"),
+    press(Action::page_next),
+    press(Action::confirm),
+    press(Action::confirm, 0.6f, "47a-channel-number-pad"),
+    press(Action::back),
+    press(Action::page_prev, 0.6f, "47b-channel-options"),
+    move(Direction::down),
+    move(Direction::down),
+    press(Action::confirm),
+    move(Direction::down),
+    move(Direction::down),
+    move(Direction::down),
+    move(Direction::down),
+    press(Action::confirm, 0.6f, "47c-hidden-channels"),
+    press(Action::confirm),
+    press(Action::back),
+    press(Action::back),
     move(Direction::down),
     press(Action::confirm, 0.6f, "48-category-children"),
     move(Direction::down),
@@ -463,10 +480,15 @@ int main(int argc, char **argv)
     ptv::Model model(data_dir);
     g_model = &model;
     model.open();
-    ptv::App app(model, fonts, renderer.glass_texture(), ptv::load_settings(data_dir),
-                 "host build");
+    auto appearance = ptv::load_settings(data_dir);
+    if (const char *theme = std::getenv("TV_THEME"))
+        appearance.theme = std::clamp(std::atoi(theme), 0, 2);
+    appearance.larger_text = std::getenv("TV_LARGER_TEXT") != nullptr;
+    appearance.high_contrast = std::getenv("TV_HIGH_CONTRAST") != nullptr;
+    ptv::App app(model, fonts, renderer.glass_texture(), appearance, "host build");
     app.configure_images(
-        [&renderer](const ptv::ImagePixels &pixels) {
+        [&renderer](const ptv::ImagePixels &pixels)
+        {
             return renderer.batch().create_texture(pixels.width, pixels.height, pixels.rgba.data());
         },
         [](std::uint32_t texture) { glDeleteTextures(1, &texture); });

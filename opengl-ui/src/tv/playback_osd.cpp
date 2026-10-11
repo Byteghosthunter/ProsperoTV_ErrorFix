@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "tv/i18n.hpp"
 #include "tv/playback_osd.hpp"
+#include "tv/theme.hpp"
 #include "tv/draw.hpp"
 #include "tv/platform.hpp"
 #include "core/save_file.hpp"
@@ -71,19 +72,31 @@ void VideoPanel::text(const hui::gfx::Font &font, std::string_view value, float 
 }
 
 bool VideoPanel::composite(void *surface, std::size_t bytes, unsigned pitch, unsigned sh,
-                           unsigned vw, unsigned vh, unsigned depth, unsigned hdr) const
+                           unsigned vw, unsigned vh, unsigned depth, unsigned hdr, float scale_x,
+                           float scale_y) const
 {
-    if (!surface || (depth != 8 && depth != 10) || (hdr && depth != 10) || !vw || !vh ||
-        vw > pitch || vh > sh || pitch > 8192 || sh > 8192 || (pitch & 1u) || !width || !height ||
-        x > 1920 || y > 1080 || width > 1920 - x || height > 1080 - y ||
-        pixels.size() != static_cast<std::size_t>(width) * height)
+    if (!std::isfinite(scale_x) || !std::isfinite(scale_y) || scale_x < 1 || scale_y < 1 ||
+        scale_x > 8192 || scale_y > 8192 || !surface || (depth != 8 && depth != 10) ||
+        (hdr && depth != 10) || !vw || !vh || vw > pitch || vh > sh || pitch > 8192 || sh > 8192 ||
+        (pitch & 1u) || !width || !height || x > 1920 || y > 1080 || width > 1920 - x ||
+        height > 1080 - y || pixels.size() != static_cast<std::size_t>(width) * height)
         return false;
     const unsigned component = depth == 10 ? 2 : 1;
     const std::size_t y_size = static_cast<std::size_t>(pitch) * sh;
     if ((y_size + static_cast<std::size_t>(pitch) * ((sh + 1) / 2)) * component > bytes)
         return false;
-    const unsigned left = x * vw / 1920, top = y * vh / 1080;
-    const unsigned right = (x + width) * vw / 1920, bottom = (y + height) * vh / 1080;
+    const auto map_x = [&](unsigned value)
+    {
+        return scale_x == 1 ? value * vw / 1920
+                            : unsigned(std::lround((.5 + (value / 1920.0 - .5) / scale_x) * vw));
+    };
+    const auto map_y = [&](unsigned value)
+    {
+        return scale_y == 1 ? value * vh / 1080
+                            : unsigned(std::lround((.5 + (value / 1080.0 - .5) / scale_y) * vh));
+    };
+    const unsigned left = map_x(x), top = map_y(y);
+    const unsigned right = map_x(x + width), bottom = map_y(y + height);
     if (left == right || top == bottom)
         return false;
     auto *out = static_cast<std::uint8_t *>(surface);
@@ -112,10 +125,12 @@ bool VideoPanel::composite(void *surface, std::size_t bytes, unsigned pitch, uns
     return true;
 }
 
-PlaybackOsd::PlaybackOsd(Model &model, const PlayRequest &request)
-    : model_(model), current_id_(request.channel_id), title_(request.channel_name),
-      live_(request.record_channel_result)
+PlaybackOsd::PlaybackOsd(Model &model, const PlayRequest &request, const Settings &settings)
+    : model_(model), settings_(settings), current_id_(request.channel_id),
+      title_(request.channel_name), live_(request.record_channel_result),
+      on_demand_(request.on_demand)
 {
+    picture_focus_ = picture_mode_ = std::clamp(settings_.picture_mode, 0, 6);
     if (live_)
     {
         for (unsigned i = 0; i < model.visible_count(); ++i)
@@ -137,7 +152,8 @@ bool PlaybackOsd::load_fonts(const std::string &directory)
     const auto load = [&](const char *name, hui::gfx::Font &font, hui::ui::FontRef &ref)
     {
         std::string data;
-        if (!hui::save::read_file(directory + "/" + name, &data, 64u << 20) || !font.load(data))
+        if (!hui::save::read_file(directory + "/" + name, &data, 64u << 20) ||
+            !load_menu_font(std::move(data), font, settings_.larger_text))
             return false;
         ref.font = &font;
         return true;
@@ -184,7 +200,7 @@ void PlaybackOsd::set_audio_state(const iptv_player_audio_state_t &state)
     std::lock_guard lock(mutex_);
     bool changed = audio_.count != state.count || audio_.selected_pid != state.selected_pid ||
                    audio_.disabled != state.disabled || audio_.pending != state.pending ||
-                   audio_.result != state.result;
+                   audio_.result != state.result || audio_.delay_ms != state.delay_ms;
     const auto count = std::min(state.count, IPTV_STREAM_MAX_AUDIO_TRACKS);
     for (unsigned i = 0; i < count && !changed; ++i)
         changed = audio_.tracks[i].pid != state.tracks[i].pid ||
@@ -200,6 +216,14 @@ void PlaybackOsd::set_audio_state(const iptv_player_audio_state_t &state)
         audio_focus_ = std::min(audio_focus_, count);
         dirty_ = true;
     }
+}
+
+std::optional<int> PlaybackOsd::take_audio_delay()
+{
+    std::lock_guard lock(mutex_);
+    const auto result = audio_delay_;
+    audio_delay_.reset();
+    return result;
 }
 
 std::optional<std::uint32_t> PlaybackOsd::take_audio_selection()
@@ -243,16 +267,95 @@ void PlaybackOsd::set_live_state(const iptv_player_live_state_t &state)
     if (state.available != history_.available || state.paused != history_.paused ||
         state.expired != history_.expired || behind(state) != behind(history_))
         dirty_ = true;
+    if (live_ && paused_ != (state.paused != 0))
+    {
+        paused_ = state.paused != 0;
+        last_activity_ = 0;
+    }
     history_ = state;
+}
+
+void PlaybackOsd::set_paused(bool paused)
+{
+    std::lock_guard lock(mutex_);
+    if (paused_ != paused)
+    {
+        paused_ = paused;
+        last_activity_ = 0;
+    }
+}
+
+bool PlaybackOsd::sleeping(std::uint64_t now) const
+{
+    return paused_ && settings_.screensaver_minutes > 0 && last_activity_ &&
+           now >= last_activity_ &&
+           now - last_activity_ >=
+               static_cast<std::uint64_t>(settings_.screensaver_minutes) * 60000000;
+}
+
+void PlaybackOsd::set_media_state(const iptv_player_media_state_t &state)
+{
+    std::lock_guard lock(mutex_);
+    if (media_.available != state.available || media_.paused != state.paused ||
+        media_.seekable != state.seekable || media_.speed_percent != state.speed_percent ||
+        media_.position_us / 1000000 != state.position_us / 1000000 ||
+        media_.duration_us != state.duration_us || media_.chapter_count != state.chapter_count)
+        dirty_ = true;
+    media_ = state;
+    media_.chapter_count = std::min(media_.chapter_count, unsigned(IPTV_PLAYER_MAX_CHAPTERS));
+    chapter_focus_ = std::min(chapter_focus_, media_.chapter_count ? media_.chapter_count - 1 : 0);
+    const auto now = platform::monotonic_us();
+    if (on_demand_ && state.presented && state.position_us && now - progress_saved_at_ >= 15000000)
+    {
+        if (model_.save_vod_progress(current_id_, state.position_us, state.duration_us))
+            progress_saved_at_ = now;
+    }
+}
+std::optional<std::uint64_t> PlaybackOsd::take_media_seek()
+{
+    std::lock_guard lock(mutex_);
+    const auto result = media_seek_;
+    media_seek_.reset();
+    return result;
+}
+std::optional<unsigned> PlaybackOsd::take_media_speed()
+{
+    std::lock_guard lock(mutex_);
+    const auto result = media_speed_;
+    media_speed_.reset();
+    return result;
+}
+
+std::optional<bool> PlaybackOsd::take_media_pause()
+{
+    std::lock_guard lock(mutex_);
+    const auto result = media_pause_;
+    media_pause_.reset();
+    return result;
 }
 
 int PlaybackOsd::input(int action, std::uint64_t now)
 {
     std::lock_guard lock(mutex_);
+    if (action >= 0)
+    {
+        const bool wake = sleeping(now);
+        last_activity_ = now;
+        if (wake)
+            return 1;
+    }
     if (action == -1)
     {
         if (platform::unix_time() / 60 != guide_minute_)
             update_guide();
+        model_.poll_programme_jobs();
+        if (const auto notice = model_.take_programme_notice(); !notice.empty())
+        {
+            now_ = notice;
+            banner_until_ = now + 8000000;
+            dirty_ = true;
+        }
+
         return 0;
     }
     if (action == IPTV_INPUT_OPTIONS)
@@ -271,7 +374,8 @@ int PlaybackOsd::input(int action, std::uint64_t now)
     {
         if (action == IPTV_INPUT_L1 || action == IPTV_INPUT_R1)
         {
-            tab_ = (tab_ + (action == IPTV_INPUT_R1 ? 1 : 2)) % 3;
+            const unsigned tabs = live_ ? 3 : 4;
+            tab_ = (tab_ + (action == IPTV_INPUT_R1 ? 1 : tabs - 1)) % tabs;
             subtitle_focus_ = 0;
             for (unsigned i = 0; i < subtitles_.tracks.size(); ++i)
                 if (subtitles_.tracks[i].id == subtitles_.selected)
@@ -279,16 +383,55 @@ int PlaybackOsd::input(int action, std::uint64_t now)
             dirty_ = true;
             return 1;
         }
+        if (tab_ == 0 && (action == IPTV_INPUT_PLAY_PAUSE || action == IPTV_INPUT_GO_LIVE ||
+                          action == IPTV_INPUT_SQUARE))
+        {
+            const int step = action == IPTV_INPUT_PLAY_PAUSE ? -50 : 50;
+            audio_delay_ = audio_.delay_ms =
+                action == IPTV_INPUT_SQUARE ? 0 : std::clamp(audio_.delay_ms + step, -2000, 2000);
+            dirty_ = true;
+            return 1;
+        }
+        if (tab_ == 3)
+        {
+            if (action == IPTV_INPUT_CIRCLE)
+                audio_menu_ = false;
+            else if (action == IPTV_INPUT_CROSS && media_.seekable && media_.chapter_count)
+            {
+                media_seek_ = media_.chapter_positions[chapter_focus_];
+                audio_menu_ = false;
+                banner_until_ = now + 5000000;
+            }
+            else if (action == IPTV_INPUT_UP || action == IPTV_INPUT_LEFT)
+                chapter_focus_ = chapter_focus_ ? chapter_focus_ - 1 : 0;
+            else if (action == IPTV_INPUT_DOWN || action == IPTV_INPUT_RIGHT)
+                chapter_focus_ = std::min(chapter_focus_ + 1,
+                                          media_.chapter_count ? media_.chapter_count - 1 : 0);
+            dirty_ = true;
+            return 1;
+        }
         if (tab_ == 2)
         {
             if (action == IPTV_INPUT_CIRCLE)
                 audio_menu_ = false;
+            else if (picture_focus_ >= 7 &&
+                     (action == IPTV_INPUT_CROSS || action == IPTV_INPUT_LEFT ||
+                      action == IPTV_INPUT_RIGHT))
+            {
+                int &value =
+                    picture_focus_ == 7 ? settings_.subtitle_size : settings_.subtitle_color;
+                value = (value + (action == IPTV_INPUT_LEFT ? 2 : 1)) % 3;
+                subtitle_cues_.clear();
+            }
             else if (action == IPTV_INPUT_CROSS)
+            {
                 picture_selection_ = picture_mode_ = picture_focus_;
+                settings_.picture_mode = picture_mode_;
+            }
             else if (action == IPTV_INPUT_UP || action == IPTV_INPUT_LEFT)
                 picture_focus_ = picture_focus_ ? picture_focus_ - 1 : 0;
             else if (action == IPTV_INPUT_DOWN || action == IPTV_INPUT_RIGHT)
-                picture_focus_ = std::min(3u, picture_focus_ + 1);
+                picture_focus_ = std::min(8u, picture_focus_ + 1);
             dirty_ = true;
             return 1;
         }
@@ -317,6 +460,17 @@ int PlaybackOsd::input(int action, std::uint64_t now)
         dirty_ = true;
         return 1;
     }
+    if (live_ && action == IPTV_INPUT_TOUCHPAD)
+    {
+        const bool stopping = model_.recording();
+        model_.toggle_recording(current_id_);
+        now_ = stopping             ? "Stopping recording..."
+               : model_.recording() ? "Recording to USB. Touchpad stops."
+                                    : "Recording requested; check USB and programme schedules.";
+        banner_until_ = now + 5000000;
+        dirty_ = true;
+        return 1;
+    }
     if (action == IPTV_INPUT_TRIANGLE || action == IPTV_INPUT_TOUCHPAD)
     {
         banner_until_ = now + 5000000;
@@ -329,7 +483,40 @@ int PlaybackOsd::input(int action, std::uint64_t now)
         return 1;
     }
     if (!live_)
-        return 0;
+    {
+        if (media_.available && action == IPTV_INPUT_PLAY_PAUSE)
+            media_pause_ = !media_.paused;
+        else if (media_.seekable && action == IPTV_INPUT_GO_LIVE)
+        {
+            constexpr unsigned speeds[] = {50, 75, 100, 125, 150, 200};
+            const auto current = media_.speed_percent ? media_.speed_percent : 100;
+            unsigned next = 50;
+            for (const auto speed : speeds)
+                if (speed > current)
+                {
+                    next = speed;
+                    break;
+                }
+            media_speed_ = media_.speed_percent = next;
+        }
+        else if (media_.seekable && action == IPTV_INPUT_SQUARE)
+            media_seek_ = 0;
+        else if (media_.seekable && (action == IPTV_INPUT_LEFT || action == IPTV_INPUT_RIGHT ||
+                                     action == IPTV_INPUT_L1 || action == IPTV_INPUT_R1))
+        {
+            const std::int64_t step =
+                (action == IPTV_INPUT_L1 || action == IPTV_INPUT_R1) ? 60000000 : 10000000;
+            const bool backwards = action == IPTV_INPUT_LEFT || action == IPTV_INPUT_L1;
+            const auto position = static_cast<std::int64_t>(media_.position_us);
+            media_seek_ = static_cast<std::uint64_t>(std::clamp<std::int64_t>(
+                position + (backwards ? -step : step), 0,
+                static_cast<std::int64_t>(media_.duration_us ? media_.duration_us - 1 : 0)));
+        }
+        else
+            return 0;
+        banner_until_ = now + 5000000;
+        return 1;
+    }
     if (!list_ && (action == IPTV_INPUT_PLAY_PAUSE || action == IPTV_INPUT_GO_LIVE ||
                    action == IPTV_INPUT_LEFT || action == IPTV_INPUT_RIGHT))
     {
@@ -397,25 +584,70 @@ std::optional<unsigned> PlaybackOsd::take_picture_selection()
     return selection;
 }
 
+bool PlaybackOsd::copy_picture_settings(Settings &settings)
+{
+    std::lock_guard lock(mutex_);
+    const bool changed = settings.picture_mode != settings_.picture_mode ||
+                         settings.subtitle_size != settings_.subtitle_size ||
+                         settings.subtitle_color != settings_.subtitle_color;
+    settings.picture_mode = settings_.picture_mode;
+    settings.subtitle_size = settings_.subtitle_size;
+    settings.subtitle_color = settings_.subtitle_color;
+    return changed;
+}
+
 void PlaybackOsd::paint()
 {
-    if (audio_menu_ && tab_ == 2)
+    if (audio_menu_ && tab_ == 3)
+    {
+        panel_.reset(80, 100, 820, 860);
+        line(tr("Chapters"), 28, 54, 32, 760);
+        line(media_.chapter_count ? tr("Choose a chapter") : tr("No chapters in this video"), 28,
+             88, 22, 760);
+        const unsigned begin = chapter_focus_ / 9 * 9;
+        for (unsigned row = 0; row < 9 && begin + row < media_.chapter_count; ++row)
+        {
+            const auto index = begin + row, top = 110 + row * 72;
+            if (index == chapter_focus_)
+                for (unsigned y = top; y < top + 66; ++y)
+                    std::fill_n(panel_.pixels.begin() + y * panel_.width + 16, 788, 66);
+            const auto seconds = media_.chapter_positions[index] / 1000000;
+            const auto title = std::string(media_.chapter_titles[index],
+                                           strnlen(media_.chapter_titles[index], 129));
+            line(std::to_string(seconds / 60) + ":" + (seconds % 60 < 10 ? "0" : "") +
+                     std::to_string(seconds % 60) + "  " + title,
+                 28, top + 43, 28, 760);
+        }
+        line(tr("L1/R1 Audio / Subtitles / Picture / Chapters"), 28, 764, 22, 760);
+        line(tr("Cross Select ? Circle Close"), 28, 833, 22, 760);
+    }
+    else if (audio_menu_ && tab_ == 2)
     {
         panel_.reset(80, 100, 820, 860);
         line(tr("Picture"), 28, 54, 32, 760);
         line(tr("Choose the shape of the picture"), 28, 88, 22, 760);
-        const char *labels[] = {"Fit original picture", "Stretch to screen", "Correct to 4:3",
-                                "Correct to 16:9"};
-        for (unsigned row = 0; row < 4; ++row)
+        const char *labels[] = {
+            "Fit original picture",     "Stretch to screen", "Correct to 4:3", "Correct to 16:9",
+            "Fill screen (crop edges)", "Zoom 125%",         "Zoom 150%"};
+        const char *sizes[] = {"Small", "Medium", "Large"};
+        const char *colors[] = {"White", "Yellow", "Cyan"};
+        for (unsigned row = 0; row < 9; ++row)
         {
-            const unsigned top = 110 + row * 72;
+            const unsigned top = 110 + row * 64;
             if (row == picture_focus_)
-                for (unsigned y = top; y < top + 66; ++y)
+                for (unsigned y = top; y < top + 58; ++y)
                     std::fill_n(panel_.pixels.begin() + y * panel_.width + 16, 788, 66);
-            line(std::string(row == picture_mode_ ? "> " : "") + tr(labels[row]), 28, top + 43, 28,
-                 760);
+            const std::string label =
+                row < 7 ? std::string(row == picture_mode_ ? "> " : "") + tr(labels[row])
+                : row == 7
+                    ? std::string(tr("Subtitle size")) + ": " + tr(sizes[settings_.subtitle_size])
+                    : std::string(tr("Subtitle color")) + ": " +
+                          tr(colors[settings_.subtitle_color]);
+            line(label, 28, top + 40, 28, 760);
         }
-        line(tr("L1/R1 Audio / Subtitles / Picture"), 28, 764, 22, 760);
+        line(live_ ? tr("L1/R1 Audio / Subtitles / Picture")
+                   : tr("L1/R1 Audio / Subtitles / Picture / Chapters"),
+             28, 764, 22, 760);
         line(tr("Cross Select · Circle Close"), 28, 833, 22, 760);
     }
     else if (audio_menu_ && (tab_ == 1))
@@ -452,13 +684,15 @@ void PlaybackOsd::paint()
             }
             line((id == subtitles_.selected ? "> " : "") + label, 28, top + 43, 28, 760);
         }
-        line(tr("L1/R1 Audio / Subtitles / Picture"), 28, 764, 22, 760);
+        line(live_ ? tr("L1/R1 Audio / Subtitles / Picture")
+                   : tr("L1/R1 Audio / Subtitles / Picture / Chapters"),
+             28, 764, 22, 760);
         line(tr("Up/Down Browse · Left/Right Page"), 28, 800, 22, 760);
         line(tr("Cross Select · Circle Close"), 28, 833, 22, 760);
     }
     else if (audio_menu_)
     {
-        panel_.reset(80, 100, 820, 860);
+        panel_.reset(80, 70, 820, 950);
         line(tr("Audio"), 28, 54, 32, 760);
         line(!audio_.count       ? tr("No supported audio tracks advertised")
              : audio_.pending    ? tr("Changing audio...")
@@ -501,9 +735,15 @@ void PlaybackOsd::paint()
             }
             line((pid == audio_.selected_pid ? "> " : "") + label, 28, top + 43, 28, 760);
         }
-        line(tr("L1/R1 Audio / Subtitles / Picture"), 28, 764, 22, 760);
-        line(tr("Up/Down Browse · Left/Right Page"), 28, 800, 22, 760);
-        line(tr("Cross Select · Circle Close"), 28, 833, 22, 760);
+        line(std::string(tr("Sound delay: ")) + (audio_.delay_ms > 0 ? "+" : "") +
+                 std::to_string(audio_.delay_ms) + tr(" ms (positive = later)"),
+             28, 785, 22, 760);
+        line(tr("L2 Earlier | R2 Later | Square Reset"), 28, 815, 22, 760);
+        line(live_ ? tr("L1/R1 Audio / Subtitles / Picture")
+                   : tr("L1/R1 Audio / Subtitles / Picture / Chapters"),
+             28, 846, 22, 760);
+        line(tr("Up/Down Browse · Left/Right Page"), 28, 876, 22, 760);
+        line(tr("Cross Select · Circle Close"), 28, 909, 22, 760);
     }
     else if (list_)
     {
@@ -520,8 +760,8 @@ void PlaybackOsd::paint()
             if (begin + row == focus_)
                 for (unsigned y = top; y < top + 66; ++y)
                     std::fill_n(panel_.pixels.begin() + y * panel_.width + 16, 728, 66);
-            line((channel.id == current_id_ ? "> " : "") + std::to_string(model_.number_of(index)) +
-                     "  " + display_name(channel),
+            line((channel.id == current_id_ ? "> " : "") + model_.number_label(index) + "  " +
+                     display_name(channel),
                  28, top + 43, 28, 700);
         }
         line(tr("Up/Down Browse · Left/Right Page"), 28, 800, 22, 700);
@@ -529,7 +769,8 @@ void PlaybackOsd::paint()
     }
     else
     {
-        panel_.reset(80, history_.available ? 690 : 770, 1760, history_.available ? 310 : 230);
+        const bool timeline = history_.available || media_.available;
+        panel_.reset(80, timeline ? 690 : 770, 1760, timeline ? 310 : 230);
         line(title_, 30, 52, 36, 1700);
         line(now_, 30, 101, 28, 1700);
         line(next_, 30, 143, 28, 1700);
@@ -551,12 +792,41 @@ void PlaybackOsd::paint()
             line(tr("L2 Pause / resume  |  Left / Right 30 seconds  |  R2 Back to live"), 30, 231,
                  24, 1700);
         }
-        line(live_
-                 ? tr("Up/Down Channel · Square Last · Cross List · Options Tracks · Triangle "
-                      "Info · "
-                      "Circle Back")
-                 : tr("Options Tracks · Triangle Info · Circle Back"),
-             30, history_.available ? 281 : 204, 24, 1700);
+        if (media_.available)
+        {
+            const auto time = [](std::uint64_t us)
+            {
+                const auto seconds = us / 1000000;
+                return std::to_string(seconds / 60) + ":" + (seconds % 60 < 10 ? "0" : "") +
+                       std::to_string(seconds % 60);
+            };
+            char speed[24];
+            const auto percent = media_.speed_percent ? media_.speed_percent : 100;
+            std::snprintf(speed, sizeof(speed), "  %u.%02ux", percent / 100, percent % 100);
+            line((media_.paused ? tr("Paused  ") : "") + time(media_.position_us) + " / " +
+                     (media_.duration_us ? time(media_.duration_us) : tr("Unknown duration")) +
+                     speed,
+                 30, 101, 28, 1700);
+            if (media_.duration_us)
+            {
+                const auto width = static_cast<unsigned>(
+                    1700.0 * std::min(media_.position_us, media_.duration_us) / media_.duration_us);
+                for (unsigned y = 125; y < 137; ++y)
+                {
+                    std::fill_n(panel_.pixels.begin() + y * panel_.width + 30, 1700, 66);
+                    std::fill_n(panel_.pixels.begin() + y * panel_.width + 30, width, 210);
+                }
+            }
+            line(media_.seekable
+                     ? tr("Left / Right 10s | L1 / R1 1 min | L2 Pause | R2 Speed | Square Restart")
+                     : tr("Seeking unavailable | L2 Pause / resume"),
+                 30, 187, 24, 1700);
+        }
+        line(live_ ? tr("Touchpad Record · Square Last · Cross List · Options Tracks · Triangle "
+                        "Info · "
+                        "Circle Back")
+                   : tr("Options Tracks · Triangle Info · Circle Back"),
+             30, timeline ? 281 : 204, 24, 1700);
     }
     dirty_ = false;
 }
@@ -570,7 +840,8 @@ void PlaybackOsd::paint_subtitles()
     };
     std::vector<Line> lines;
     float widest = 0;
-    constexpr float size = 36, max_width = 1560;
+    const float sizes[] = {28, 36, 46};
+    const float size = sizes[std::clamp(settings_.subtitle_size, 0, 2)], max_width = 1560;
     for (const auto &cue : subtitle_cues_)
     {
         if (!cue)
@@ -603,12 +874,35 @@ void PlaybackOsd::paint_subtitles()
             break;
     }
     const unsigned width = lines.empty() ? 0 : static_cast<unsigned>(std::ceil(widest)) + 44;
+    const float scale = settings_.larger_text ? 1.25f : 1;
+    const unsigned line_height = static_cast<unsigned>(size * scale * 1.28f);
+    const unsigned baseline = static_cast<unsigned>(size * scale * 1.17f);
     subtitle_panel_.reset((1920 - width) / 2, 0, width,
-                          lines.size() * 46 + (lines.empty() ? 0 : 20));
+                          lines.size() * line_height + (lines.empty() ? 0 : 20));
     for (unsigned i = 0; i < lines.size(); ++i)
         subtitle_panel_.text(*lines[i].font, lines[i].text,
-                             (width - lines[i].font->measure(lines[i].text, size)) / 2, 42 + i * 46,
-                             size, max_width);
+                             (width - lines[i].font->measure(lines[i].text, size)) / 2,
+                             baseline + i * line_height, size, max_width);
+    styled_subtitles_.canvas_width = 1920;
+    styled_subtitles_.canvas_height = 1080;
+    styled_subtitles_.bitmaps.clear();
+    if (!width)
+        return;
+    iptv::SubtitleBitmap bitmap;
+    bitmap.x = subtitle_panel_.x;
+    bitmap.width = width;
+    bitmap.height = subtitle_panel_.height;
+    const unsigned colors[] = {0xffffff, 0xffff00, 0x00ffff};
+    const unsigned color = colors[std::clamp(settings_.subtitle_color, 0, 2)];
+    bitmap.argb.reserve(subtitle_panel_.pixels.size());
+    for (const auto value : subtitle_panel_.pixels)
+    {
+        const unsigned alpha = (std::max(28u, unsigned(value)) - 28) * 255 / 207;
+        const auto channel = [&](unsigned shift)
+        { return (14 * (255 - alpha) + ((color >> shift) & 255) * alpha) / 255; };
+        bitmap.argb.push_back(0xff000000u | (channel(16) << 16) | (channel(8) << 8) | channel(0));
+    }
+    styled_subtitles_.bitmaps.push_back(std::move(bitmap));
 }
 
 bool PlaybackOsd::draw(void *surface, std::size_t bytes, unsigned pitch, unsigned sh, unsigned vw,
@@ -617,6 +911,35 @@ bool PlaybackOsd::draw(void *surface, std::size_t bytes, unsigned pitch, unsigne
                        unsigned hdr)
 {
     std::lock_guard lock(mutex_);
+    if (!last_activity_ || !paused_)
+        last_activity_ = now;
+    if (sleeping(now))
+    {
+        if (!surface)
+            return true;
+        if ((depth != 8 && depth != 10) || !vw || !vh || vw > pitch || vh > sh || pitch > 8192 ||
+            sh > 8192 || (pitch & 1u))
+            return false;
+        const std::size_t luma = static_cast<std::size_t>(pitch) * sh;
+        const std::size_t samples = luma + static_cast<std::size_t>(pitch) * ((sh + 1) / 2);
+        if (samples * (depth == 10 ? 2 : 1) > bytes)
+            return false;
+        if (depth == 8)
+        {
+            std::memset(surface, 16, luma);
+            std::memset(static_cast<std::uint8_t *>(surface) + luma, 128, samples - luma);
+        }
+        else
+        {
+            auto *pixels = static_cast<std::uint8_t *>(surface);
+            for (std::size_t i = 0; i < samples; ++i)
+            {
+                const std::uint16_t value = i < luma ? 64 : 512;
+                std::memcpy(pixels + i * 2, &value, sizeof(value));
+            }
+        }
+        return true;
+    }
     if (!fonts_.regular.font)
         return false;
     if (!started_)
@@ -624,7 +947,8 @@ bool PlaybackOsd::draw(void *surface, std::size_t bytes, unsigned pitch, unsigne
         started_ = true;
         banner_until_ = now + 5000000;
     }
-    const bool overlay = list_ || audio_menu_ || history_.paused || now < banner_until_;
+    const bool overlay =
+        list_ || audio_menu_ || history_.paused || media_.paused || now < banner_until_;
     const bool captions = !list_ && !audio_menu_ && !subtitles.empty();
     if (!overlay && !captions)
     {
@@ -633,6 +957,20 @@ bool PlaybackOsd::draw(void *surface, std::size_t bytes, unsigned pitch, unsigne
     }
     if (!surface)
         return true;
+    // Keep controls and captions inside the visible crop, independent of picture zoom.
+    const float aspect = vh ? float(vw) / vh / (1920.0f / 1080.0f) : 1;
+    float scale_x = 1, scale_y = 1;
+    if (picture_mode_ == 4)
+    {
+        scale_x = std::max(1.0f, aspect);
+        scale_y = std::max(1.0f, 1 / aspect);
+    }
+    else if (picture_mode_ >= 5)
+    {
+        const float zoom = picture_mode_ == 5 ? 1.25f : 1.5f;
+        scale_x = std::max(1.0f, std::min(1.0f, aspect) * zoom);
+        scale_y = std::max(1.0f, std::min(1.0f, 1 / aspect) * zoom);
+    }
     bool drawn = false;
     if (captions)
     {
@@ -644,18 +982,25 @@ bool PlaybackOsd::draw(void *surface, std::size_t bytes, unsigned pitch, unsigne
         for (const auto &cue : subtitles)
             if (cue)
                 drawn = composite_subtitle_bitmaps(*cue, surface, bytes, pitch, sh, vw, vh, depth,
-                                                   hdr) ||
+                                                   hdr, scale_x, scale_y) ||
                         drawn;
         if (subtitle_panel_.height)
         {
             subtitle_panel_.y =
                 (overlay ? (history_.available ? 660 : 740) : 1030) - subtitle_panel_.height;
-            drawn =
-                subtitle_panel_.composite(surface, bytes, pitch, sh, vw, vh, depth, hdr) || drawn;
+            if (!styled_subtitles_.bitmaps.empty())
+            {
+                styled_subtitles_.bitmaps[0].y = subtitle_panel_.y;
+                drawn = composite_subtitle_bitmaps(styled_subtitles_, surface, bytes, pitch, sh, vw,
+                                                   vh, depth, hdr, scale_x, scale_y) ||
+                        drawn;
+            }
         }
     }
     if (overlay && dirty_)
         paint();
-    return (overlay && panel_.composite(surface, bytes, pitch, sh, vw, vh, depth, hdr)) || drawn;
+    return (overlay &&
+            panel_.composite(surface, bytes, pitch, sh, vw, vh, depth, hdr, scale_x, scale_y)) ||
+           drawn;
 }
 } // namespace ptv

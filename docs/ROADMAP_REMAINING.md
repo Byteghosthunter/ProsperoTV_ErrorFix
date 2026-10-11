@@ -838,3 +838,72 @@ served from a PC on the same network:
 Still open, each needing a person or equipment: the system keyboard itself
 (the script answers in its place), HDR on a display, and a second console
 user.
+
+## Appearance and accessibility implementation (October 11)
+
+Settings now persists Dusk, Ocean and Forest palettes, 25% larger text,
+high contrast, and an Off / 1 / 5 / 10 minute screensaver. Themes recolor
+menu geometry without recoloring logos or video. High contrast uses black
+panels and opaque white text/outlines. Larger text loads scaled font metrics
+when the next menu opens, including East Asian fallback fonts and playback
+controls. Long footer hints wrap into two rows.
+
+The screensaver blanks idle menus and paused SDR/Main10 video; active
+multiview stays visible and idle live preview stops. The first button wakes
+without activating the underlying control. VOD pause state reaches
+PlaybackOsd::set_paused through the media-state integration.
+
+Host validation covers settings navigation/persistence, glyph measurement
+and rendering scale, palette/image preservation, glass geometry, menu wake
+consumption and paused SDR/Main10 planes. Native visual and timer checks
+still require an idle console. No spoken-focus switch was added: the pinned
+homebrew SDK exposes no usable text-to-speech API; the system screen reader
+does not establish an app-callable interface for this custom renderer.
+
+## Picture and caption controls (October 11)
+
+The Picture tab now includes Fill (crop), 125% zoom, 150% zoom, and text
+subtitle size/color. Selection reaches the foreground AGC viewport and is
+saved immediately. Cropped views remap controls and captions into their
+visible source region. Captions use the existing SDR/PQ/HLG compositor;
+bitmap subtitles keep the provider's artwork. Native hardware visual
+verification is still pending an idle console.
+
+## USB recording and programme reminders (October 2026)
+
+The guide Options menu schedules/cancels recordings and reminders and lists their
+saved state and failure reason. Touchpad starts/stops the current live channel:
+it records until the current programme ends, or for two hours without guide data.
+Jobs are stored per profile in `prosperotv-programmes.sqlite3`; stream credentials
+are resolved from the source at execution time and are not copied into schedules.
+One recording can run at once, with up to 128 saved jobs and a 24-hour maximum per
+recording. Conflicting recordings are rejected. The app must stay running; these
+jobs do not wake or launch the console. Late reminders appear while their programme
+is still on; missed/aborted jobs are marked explicitly after restart.
+
+Recordings use the first detected normal `/mnt/usb0` through `/mnt/usb7` mount and
+are written as `ProsperoTV-<start>-<job>.ts`. An extra provider connection is required.
+Direct TS is preserved; MP4/Matroska and HLS are remuxed through the same bounded
+container reader as playback. Container subtitle retention is format-dependent.
+Writes use exclusive temporary files, periodic flushes, disconnect checks, and
+retain `.partial` on write/network failure. Early stream EOF is reported as a
+failure rather than claiming the whole scheduled programme was captured. Recording
+never changes console permissions or accesses an elevated USB namespace. ExFAT is
+appropriate for long recordings; filesystem file-size limits are reported as errors.
+Parental schedules require an unlocked adult session and stop if the profile locks.
+
+Host regressions exercise real writes, cancellation, disconnected directories,
+write-limit failure, existing-file preservation, conflicts, restart recovery, and
+one-shot reminders. Native transport tests use the real FFmpeg remuxer with file-backed
+HTTP, fragmented input, scoped credentials, cancellation, and output re-parsing.
+Physical console USB writing and unplugging have **not** passed acceptance yet.
+
+### Picture in picture
+
+Touchpad in multiview pins its selected live channel in the upper-right corner while browsing lists or the guide. Other decoder connections stop; the selected connection continues without reopening. L3 from the live list closes it. Starting full-screen playback or a storage operation uses the existing joined preview shutdown. Parental/source changes invalidate the pinned request and close it. Sound uses the existing single-preview audio owner. No second decoder architecture or full-resolution framebuffer is allocated; the preview remains bounded at 960 x 540. Host tests cover connection continuity, stopping other tiles, one audio owner, texture release, list navigation and guide opening. Physical console rendering/audio acceptance remains untested.
+
+### Recently added and most watched
+
+Live TV has two new chips beside Recent. Recently added sorts channels by when this profile first observed them; existing channels keep that timestamp across refreshes and restarts. This is explicitly labelled first seen by the app, not a provider publication date. Most watched ranks successful foreground viewing sessions lasting at least ten seconds with receipt-confirmed presented video. It excludes previews, failed opens, cancellation while tuning, VOD and catch-up. Equal ranks keep alphabetic order. Both lists use the existing hidden-category, parental and search filters. Metadata is persisted in the profile library database, keyed by saved source and channel identity; the in-memory vector is bounded by the current catalog size. No watch history is inferred from earlier releases. Host tests exercise observation timestamps, source isolation, persistence, ranked lookup/filtering, receipt qualification and controller access.
+
+Programme schedules and reminders are included in version 2 settings backups. Version 1 backups still restore; because they predate schedules, restoring one clears newer schedules instead of retaining jobs tied to replaced source accounts. Storage operations stop and join an active recording, save its final result, and close the schedules database before replacing profile files. Normal playback/menu transitions retain the scheduler.

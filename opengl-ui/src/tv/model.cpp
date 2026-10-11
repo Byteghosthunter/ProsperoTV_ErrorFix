@@ -230,8 +230,8 @@ const char *Model::builtin_url()
 
 const char *Model::group_name(Group group)
 {
-    static constexpr const char *names[kGroupCount] = {"All",  "Favorites", "Recent",
-                                                       "News", "Sports",    "Kids"};
+    static constexpr const char *names[kGroupCount] = {
+        "All", "Favorites", "Recent", "News", "Sports", "Kids", "Recently added", "Most watched"};
     return names[static_cast<unsigned>(group)];
 }
 
@@ -310,6 +310,8 @@ bool Model::open()
     catalog_failed_ = false;
     catalog_error_.clear();
 
+    if (!programme_jobs_.open(path("prosperotv-programmes.sqlite3")))
+        notify(Level::error, "Programme schedules could not be opened");
     if (first)
     {
         if (!parental_.load(path("prosperotv-parental-v1.txt")))
@@ -381,6 +383,7 @@ bool Model::open()
 void Model::close()
 {
     clear_pin();
+    end_search();
     vod_.stop();
     stop_guide();
     stop_requested_.store(true, std::memory_order_release);
@@ -411,25 +414,39 @@ void Model::close()
 
 bool Model::close_for_storage()
 {
+    recorder_.cancel();
+    recorder_.join();
+    if (recording_job_ != 0)
+    {
+        programme_jobs_.finish(recording_job_, recorder_.succeeded() ? 2 : 3, recorder_.result());
+        recording_job_ = 0;
+    }
     close();
-    return library_.close();
+    const bool programmes_closed = programme_jobs_.close();
+    const bool library_closed = library_.close();
+    return programmes_closed && library_closed;
 }
 
 void Model::poll()
 {
+    poll_programme_jobs();
     check_sleep_timer();
     if (keyboard_ready_)
         iptv_ime_poll();
     poll_pin();
     continue_account_form();
     consume_refresh();
-    if (vod_.requested() && !refreshing())
+    if ((vod_.requested() || search_pending()) && !refreshing())
         stop_guide();
-    vod_.poll(!refreshing() && !guide_thread_);
-    if (!vod_.busy() && !vod_.requested())
+    vod_.poll(!refreshing() && !guide_thread_ && !search_busy());
+    search_movies_.poll(searching_ && !refreshing() && !guide_thread_ && !vod_.busy() &&
+                        !vod_.requested() && !search_shows_.busy());
+    search_shows_.poll(searching_ && !refreshing() && !guide_thread_ && !vod_.busy() &&
+                       !vod_.requested() && !search_movies_.busy() && !search_movies_.requested());
+    if (!vod_.busy() && !vod_.requested() && !search_busy() && !search_pending())
         poll_guide();
     const auto now = platform::unix_time();
-    if (catalog_loaded_ && !refreshing() && !vod_.busy() && now >= next_schedule_check_)
+    if (catalog_loaded_ && !refreshing() && !vod_.busy() && !searching_ && now >= next_schedule_check_)
     {
         // A failed scheduled refresh retries in an hour, not on every frame.
         next_schedule_check_ = now + 3600;
@@ -452,8 +469,8 @@ void Model::load_cache()
         iptv::LoadCatalog(cache_path(active_source_), &cached, {}, &report);
     catalog_loaded_ = status == iptv::StoreStatus::ok && report.catalog_version >= 5 &&
                       cached.source_id == wanted && !cached.empty();
-    playlist_cache_needs_refresh_ = catalog_loaded_ && active_source_ == iptv::SourceKind::Custom &&
-                                    report.catalog_version < 6;
+    playlist_cache_needs_refresh_ =
+        catalog_loaded_ && active_source_ == iptv::SourceKind::Custom && report.catalog_version < 6;
     catalog_ = catalog_loaded_ ? std::move(cached) : iptv::Catalog{};
     saved_unix_ = catalog_loaded_ ? report.saved_unix : 0;
     if (catalog_loaded_)
@@ -472,7 +489,16 @@ void Model::load_cache()
 // The catalog and its index are new: everything counted from them follows.
 void Model::adopt_catalog()
 {
+    channel_names_ = library_.channel_names(source_id(active_source_));
+    hidden_channels_ = library_.hidden_channels(source_id(active_source_));
+    channel_order_ = library_.channel_order(source_id(active_source_), false);
+    favorite_order_ = library_.channel_order(source_id(active_source_), true);
+    if (!channel_names_.empty())
+        index_.build(catalog_, channel_names_);
     vod_.playlist_updated();
+    if (!catalog_.empty())
+        (void)library_.observe_channels(selected_source_id_, catalog_, platform::unix_time());
+    channel_history_ = library_.channel_history(selected_source_id_, catalog_);
     hidden_categories_ = library_.hidden_categories(source_id(active_source_));
     category_rules_ = library_.category_rules(source_id(active_source_));
     folder_channels_ = library_.folder_channels(folder_);
@@ -538,6 +564,13 @@ void Model::recount_groups()
         if ((mark & 4u) != 0)
             continue;
         ++shown;
+        if (index < channel_history_.size())
+        {
+            if (channel_history_[index].first_seen > 0)
+                ++group_sizes_[static_cast<unsigned>(Group::recently_added)];
+            if (channel_history_[index].watches > 0)
+                ++group_sizes_[static_cast<unsigned>(Group::most_watched)];
+        }
         favorites += (mark & kFavoriteMark) != 0 ? 1u : 0u;
         recent += (mark & kRecentMark) != 0 ? 1u : 0u;
         news += (trait & CatalogIndex::kNews) != 0 ? 1u : 0u;
@@ -559,7 +592,7 @@ void Model::recount_groups()
 void Model::rebuild_visible()
 {
     if (index_.size() != catalog_.size())
-        index_.build(catalog_);
+        index_.build(catalog_, channel_names_);
     if (marks_.size() != catalog_.size())
         mark_lists();
     std::uint8_t trait_wanted = 0;
@@ -614,7 +647,7 @@ void Model::rebuild_visible()
             continue;
         if (by_word)
         {
-            const iptv::ChannelView channel = catalog_[index];
+            const iptv::ChannelView channel = this->channel(index);
             if (!matches_filters(channel, country_, category_, language_) ||
                 (!matches_query(channel, query_, quality) &&
                  !guide_.matches_now(channel.id, query_, guide_time)))
@@ -625,6 +658,40 @@ void Model::rebuild_visible()
             start = static_cast<int>(visible_.size());
         visible_.push_back(index);
     }
+    const auto &saved_order = group_ == Group::favorites ? favorite_order_ : channel_order_;
+    const bool ranked = group_ == Group::recently_added || group_ == Group::most_watched;
+    if (ranked)
+    {
+        const auto rank = [this](unsigned index)
+        {
+            if (index >= channel_history_.size())
+                return std::int64_t{0};
+            return group_ == Group::recently_added ? channel_history_[index].first_seen
+                                                   : channel_history_[index].watches;
+        };
+        std::erase_if(visible_, [&](unsigned index) { return rank(index) == 0; });
+        std::stable_sort(visible_.begin(), visible_.end(),
+                         [&](unsigned a, unsigned b) { return rank(a) > rank(b); });
+    }
+    else if (!saved_order.empty())
+    {
+        std::vector<std::size_t> ranks(catalog_.size(), saved_order.size());
+        for (std::size_t i = 0; i < saved_order.size(); ++i)
+            if (const auto at = catalog_.Find(saved_order[i]); at != iptv::Catalog::npos)
+                ranks[at] = i;
+        std::stable_sort(visible_.begin(), visible_.end(),
+                         [&](unsigned a, unsigned b) { return ranks[a] < ranks[b]; });
+    }
+    if (ranked || !saved_order.empty())
+    {
+        letter_starts_.fill(-1);
+        for (std::size_t i = 0; i < visible_.size(); ++i)
+        {
+            int &start = letter_starts_[index_.letters[visible_[i]]];
+            if (start < 0)
+                start = static_cast<int>(i);
+        }
+    }
     visible_count_ = static_cast<unsigned>(visible_.size());
     ++revision_;
 }
@@ -634,11 +701,41 @@ int Model::letter_at(unsigned position) const
     return position < visible_count_ ? index_.letters[visible_[position]] : 0;
 }
 
+std::string Model::number_label(unsigned catalog_index) const
+{
+    if (catalog_index >= channel_count())
+        return {};
+    const auto value = channel(catalog_index).channel_number;
+    return iptv::ValidChannelNumber(value) ? std::string(value)
+                                           : std::to_string(number_of(catalog_index));
+}
+
+int Model::position_for_number(std::string_view number) const
+{
+    if (!iptv::ValidChannelNumber(number))
+        return -1;
+    int found = -1;
+    for (unsigned position = 0; position < visible_count(); ++position)
+        if (number_label(visible(position)) == number)
+        {
+            if (found >= 0)
+                return -2;
+            found = static_cast<int>(position);
+        }
+    return found;
+}
+
 int Model::position_of(std::string_view channel_id) const
 {
     const std::size_t index = catalog_.Find(channel_id);
     if (index == iptv::Catalog::npos || index >= index_.ranks.size())
         return -1;
+    if (group_ == Group::recently_added || group_ == Group::most_watched ||
+        !(group_ == Group::favorites ? favorite_order_ : channel_order_).empty())
+    {
+        const auto found = std::find(visible_.begin(), visible_.end(), index);
+        return found == visible_.end() ? -1 : static_cast<int>(found - visible_.begin());
+    }
     // The list is in the order of the alphabet, and so are the ranks: the
     // channel is where its rank falls.
     const std::uint32_t rank = index_.ranks[index];
@@ -660,7 +757,7 @@ std::optional<iptv::ChannelView> Model::find(std::string_view channel_id) const
                    ? std::nullopt
                    : std::optional<iptv::ChannelView>(vod_.catalog()[media]);
     }
-    return catalog_[index];
+    return channel(static_cast<unsigned>(index));
 }
 
 // ---- groups, search and filters ----------------------------------------------
@@ -809,9 +906,10 @@ std::optional<PlayRequest> Model::preview_request(std::string_view channel_id) c
         return {};
     const auto index = catalog_.Find(channel_id);
     if (index >= catalog_.size() || pin_prompt() ||
+        hidden_channels_.contains(std::string(channel_id)) ||
         catalog_[index].media_kind != iptv::MediaKind::live || !content_allowed(catalog_[index]))
         return {};
-    const auto channel = catalog_[index];
+    const auto channel = this->channel(static_cast<unsigned>(index));
     PlayRequest request;
     request.channel_id = channel.id;
     request.channel_name = channel.name;
@@ -861,10 +959,11 @@ std::optional<unsigned> Model::previous_channel(std::string_view current) const
 bool Model::play(unsigned catalog_index)
 {
     if (catalog_index >= channel_count() || pin_prompt() ||
+        hidden_channels_.contains(std::string(catalog_[catalog_index].id)) ||
         catalog_[catalog_index].media_kind != iptv::MediaKind::live ||
         !content_allowed(catalog_[catalog_index]))
         return false;
-    const iptv::ChannelView channel = catalog_[catalog_index];
+    const iptv::ChannelView channel = this->channel(catalog_index);
     sleep_timer.wake();
     play_request_ = {};
     play_request_.channel_id = channel.id;
@@ -922,6 +1021,19 @@ bool Model::take_play_request(PlayRequest *request)
     play_request_ = {};
     play_requested_ = false;
     return true;
+}
+
+void Model::report_watch(std::string_view channel_id)
+{
+    const auto index = catalog_.Find(channel_id);
+    if (index == iptv::Catalog::npos || catalog_[index].media_kind != iptv::MediaKind::live)
+        return;
+    if (library_.record_watch(selected_source_id_, channel_id))
+    {
+        channel_history_ = library_.channel_history(selected_source_id_, catalog_);
+        recount_groups();
+        rebuild_visible();
+    }
 }
 
 void Model::report_playback_failure(const char *channel_id, const char *channel_name, int result,
@@ -1207,6 +1319,7 @@ void Model::apply_account_password(const char *password)
 
 void Model::refresh()
 {
+    end_search();
     vod_.stop();
     stop_guide();
     next_schedule_check_ = platform::unix_time() + 3600;
@@ -1596,6 +1709,82 @@ void Model::consume_refresh()
         refresh_queued_ = false;
         refresh();
     }
+}
+
+std::vector<Model::SearchResult> Model::search_results(std::string_view query,
+                                                     bool *truncated) const
+{
+    std::vector<SearchResult> rows;
+    if (truncated)
+        *truncated = false;
+    if (query.empty())
+        return rows;
+    constexpr unsigned limit = 250;
+    const auto source = source_id(active_source_);
+    const auto append = [&](SearchResult row, unsigned &count)
+    {
+        if (count++ < limit)
+            rows.push_back(std::move(row));
+        else if (truncated)
+            *truncated = true;
+    };
+    unsigned count = 0;
+    for (unsigned at : index_.order)
+    {
+        if (!channel_visible(at))
+            continue;
+        const auto item = channel(at);
+        const unsigned quality = index_.traits[at] & CatalogIndex::kQualityMask;
+        if ((quality_ != kQualityAny && quality_ != quality) ||
+            !matches_filters(item, country_, category_, language_))
+            continue;
+        if (matches_query(item, query, quality))
+            append({SearchResult::Kind::channel, std::string(item.id), std::string(item.name),
+                    std::string(item.group_title), 0, source},
+                   count);
+        if (count > limit)
+            break;
+    }
+    for (const auto *library : {&search_movies_, &search_shows_})
+    {
+        if (!searching_)
+            break;
+        count = 0;
+        for (unsigned i = 0; i < library->catalog().size(); ++i)
+        {
+            const auto item = library->catalog()[i];
+            if (!search_vod_allowed(item) || !contains_nocase(item.name, query))
+                continue;
+            append(
+                {library == &search_movies_ ? SearchResult::Kind::movie : SearchResult::Kind::show,
+                 std::string(item.id), std::string(item.name), std::string(item.group_title), 0,
+                 source},
+                count);
+            if (count > limit)
+                break;
+        }
+    }
+    count = 0;
+    for (unsigned at : index_.order)
+    {
+        if (!channel_visible(at))
+            continue;
+        const auto item = channel(at);
+        for (const auto &programme : guide_.programmes(item.id))
+        {
+            if (!contains_nocase(programme.title, query))
+                continue;
+            append({SearchResult::Kind::programme, std::string(item.id), programme.title,
+                    std::string(item.name) + " / " + programme_time(programme.start, true),
+                    programme.start, source},
+                   count);
+            if (count > limit)
+                break;
+        }
+        if (count > limit)
+            break;
+    }
+    return rows;
 }
 
 } // namespace ptv

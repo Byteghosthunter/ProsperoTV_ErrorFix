@@ -13,6 +13,10 @@
 #include <map>
 
 struct sqlite3;
+namespace iptv
+{
+class Catalog;
+}
 
 namespace ptv
 {
@@ -43,6 +47,14 @@ bool valid_source(const SavedSource &source);
 
 // All mutations are committed before callers update their in-memory state.
 // The original catalog and favorites files remain readable by older releases.
+bool completed_watch(std::string_view receipt, std::int64_t seconds, int result);
+
+struct ChannelHistory
+{
+    std::int64_t first_seen = 0;
+    std::int64_t watches = 0;
+};
+
 class Library
 {
   public:
@@ -61,10 +73,24 @@ class Library
     bool remove_source(std::int64_t id);
     std::int64_t selected_source() const;
     bool select_source(std::int64_t id);
+    bool observe_channels(std::int64_t source, const iptv::Catalog &catalog, std::int64_t now);
+    std::vector<ChannelHistory> channel_history(std::int64_t source,
+                                                const iptv::Catalog &catalog) const;
+    bool record_watch(std::int64_t source, std::string_view channel);
     bool remember_channel(std::int64_t source, std::string_view channel);
     std::pair<std::int64_t, std::string> last_channel() const;
+    std::pair<std::uint64_t, std::uint64_t> playback_progress(std::string_view channel) const;
+    bool save_playback_progress(std::string_view channel, std::uint64_t position_us,
+                                std::uint64_t duration_us);
     std::unordered_set<std::string> hidden_categories(std::uint64_t source) const;
     bool hide_category(std::uint64_t source, std::string_view category, bool hidden);
+    std::map<std::string, std::string, std::less<>> channel_names(std::uint64_t source) const;
+    bool rename_channel(std::uint64_t source, std::string_view channel, std::string_view name);
+    std::unordered_set<std::string> hidden_channels(std::uint64_t source) const;
+    bool hide_channel(std::uint64_t source, std::string_view channel, bool hidden);
+    std::vector<std::string> channel_order(std::uint64_t source, bool favorites) const;
+    bool save_channel_order(std::uint64_t source, bool favorites,
+                            const std::vector<std::string> &ids);
     // 1: PIN required, 2: approved for kids. Rules include subcategories.
     std::map<std::string, int> category_rules(std::uint64_t source) const;
     bool set_category_rule(std::uint64_t source, std::string_view category, int rule);

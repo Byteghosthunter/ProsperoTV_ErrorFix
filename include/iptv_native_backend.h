@@ -95,6 +95,9 @@ extern "C"
         /* Called on the draining caller's thread while queued video finishes. */
         void (*poll_controls)(void *context);
         void *controls_context;
+        uint32_t speed_percent; /* 0 or 100 is normal; 50 through 200 is supported. */
+        /* Only set when submit_video runs on the foreground control thread. */
+        uint32_t poll_during_submit;
     } iptv_native_open_config_t;
 
     typedef struct iptv_native_telemetry
@@ -216,6 +219,8 @@ extern "C"
     /* Control-thread requests while an opened backend remains alive; only
      * atomic state is touched. Reposition releases
      * blocked submissions. The stream owner must then reset its timeline. */
+    /* Positive values make sound later than the picture, in milliseconds. */
+    void iptv_native_backend_set_audio_delay(iptv_native_backend_t *backend, int milliseconds);
     void iptv_native_backend_set_paused(iptv_native_backend_t *backend, int paused);
     int iptv_native_backend_paused(const iptv_native_backend_t *backend);
     void iptv_native_backend_request_reposition(iptv_native_backend_t *backend);

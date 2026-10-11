@@ -4,6 +4,7 @@
 #pragma once
 
 #include "tv/model.hpp"
+#include "tv/settings.hpp"
 #include "ui/fonts.hpp"
 #include "iptv_player.h"
 #include <mutex>
@@ -22,16 +23,19 @@ struct VideoPanel
               float size, float max_width, std::uint8_t ink = 235);
     bool composite(void *surface, std::size_t bytes, unsigned pitch, unsigned surface_height,
                    unsigned visible_width, unsigned visible_height, unsigned depth,
-                   unsigned hdr = false) const;
+                   unsigned hdr = false, float scale_x = 1, float scale_y = 1) const;
 };
 bool composite_subtitle_bitmaps(const iptv::SubtitleCue &cue, void *surface, std::size_t bytes,
                                 unsigned pitch, unsigned surface_height, unsigned visible_width,
-                                unsigned visible_height, unsigned depth, unsigned hdr = false);
+                                unsigned visible_height, unsigned depth, unsigned hdr = false,
+                                float scale_x = 1, float scale_y = 1);
 
 class PlaybackOsd
 {
   public:
-    PlaybackOsd(Model &model, const PlayRequest &request);
+    PlaybackOsd(Model &model, const PlayRequest &request, const Settings &settings = {});
+    void set_paused(bool paused);
+    bool copy_picture_settings(Settings &settings);
     bool load_fonts(const std::string &directory);
     // The control thread alone calls input and reads selected_channel. Drawing
     // can happen on the presentation worker, protected by the same mutex.
@@ -39,8 +43,13 @@ class PlaybackOsd
     std::optional<unsigned> take_picture_selection();
     void set_audio_state(const iptv_player_audio_state_t &state);
     std::optional<std::uint32_t> take_audio_selection();
+    std::optional<int> take_audio_delay();
     void set_subtitle_state(const iptv::SubtitleState &state);
     void set_live_state(const iptv_player_live_state_t &state);
+    void set_media_state(const iptv_player_media_state_t &state);
+    std::optional<std::uint64_t> take_media_seek();
+    std::optional<bool> take_media_pause();
+    std::optional<unsigned> take_media_speed();
     std::optional<std::uint32_t> take_subtitle_selection();
     std::optional<unsigned> selected_channel() const
     {
@@ -58,13 +67,25 @@ class PlaybackOsd
     int select(unsigned index);
     void line(std::string_view value, float x, float y, float size, float width);
     Model &model_;
+    Settings settings_;
+    bool paused_ = false;
+    std::uint64_t last_activity_ = 0;
+    bool sleeping(std::uint64_t now) const;
     std::string current_id_, title_, now_, next_;
     bool live_ = false, list_ = false, dirty_ = true, started_ = false;
     bool audio_menu_ = false;
     iptv_player_live_state_t history_{};
+    iptv_player_media_state_t media_{};
+    bool on_demand_ = false;
+    unsigned chapter_focus_ = 0;
+    std::uint64_t progress_saved_at_ = 0;
+    std::optional<std::uint64_t> media_seek_;
+    std::optional<bool> media_pause_;
+    std::optional<unsigned> media_speed_;
     unsigned audio_focus_ = 0;
     iptv_player_audio_state_t audio_{};
     std::optional<std::uint32_t> audio_selection_;
+    std::optional<int> audio_delay_;
     iptv::SubtitleState subtitles_;
     unsigned tab_ = 0, picture_focus_ = 0, picture_mode_ = 0;
     std::optional<unsigned> picture_selection_;
@@ -81,5 +102,6 @@ class PlaybackOsd
     hui::ui::Fonts fonts_;
     VideoPanel panel_;
     VideoPanel subtitle_panel_;
+    iptv::SubtitleCue styled_subtitles_;
 };
 } // namespace ptv

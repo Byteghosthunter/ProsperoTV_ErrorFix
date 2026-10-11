@@ -456,7 +456,8 @@ bool LooksLikeMedia(const std::uint8_t *bytes, std::size_t count)
             return true;
     return false;
 }
-int ReadMedia(const MediaInput &input, const MediaOutput &output, std::string *error)
+int ReadMedia(const MediaInput &input, const MediaOutput &output, std::string *error,
+              std::int64_t start_us)
 {
     const auto fail = [&](const char *message)
     {
@@ -466,7 +467,7 @@ int ReadMedia(const MediaInput &input, const MediaOutput &output, std::string *e
     };
     if (error)
         error->clear();
-    if (!input.read || !output.write)
+    if (!input.read || !output.write || start_us < 0 || start_us > INT64_MAX / 4)
         return fail("The media reader could not start.");
     const bool hls = input.url && input.open_resource;
     // Library diagnostics can include complete provider URLs. The application
@@ -508,7 +509,8 @@ int ReadMedia(const MediaInput &input, const MediaOutput &output, std::string *e
     r.demux->max_index_size = 8 * 1024 * 1024;
     AVDictionary *options = nullptr;
     av_dict_set(&options, "format_whitelist",
-                hls ? "hls,mpegts,mov,matroska,webm,aac,ac3,eac3,mp3,webvtt" : "mov,matroska,webm",
+                hls ? "hls,mpegts,mov,matroska,webm,aac,ac3,eac3,mp3,webvtt"
+                    : "mov,matroska,webm,mpegts",
                 0);
     av_dict_set(&options, "protocol_whitelist", "", 0);
     if (hls)
@@ -552,7 +554,8 @@ int ReadMedia(const MediaInput &input, const MediaOutput &output, std::string *e
         const auto *p = r.demux->streams[i]->codecpar;
         if (video < 0 && p->codec_type == AVMEDIA_TYPE_VIDEO &&
             !(r.demux->streams[i]->disposition & AV_DISPOSITION_ATTACHED_PIC) &&
-            (p->codec_id == AV_CODEC_ID_H264 || p->codec_id == AV_CODEC_ID_HEVC))
+            (p->codec_id == AV_CODEC_ID_H264 || p->codec_id == AV_CODEC_ID_HEVC ||
+             (p->codec_id == AV_CODEC_ID_VP9 && output.vp9_packet)))
             video = static_cast<int>(i);
         if (p->codec_type == AVMEDIA_TYPE_AUDIO && audio_supported(p->codec_id))
             tracks.push_back(static_cast<int>(i));
@@ -594,14 +597,122 @@ int ReadMedia(const MediaInput &input, const MediaOutput &output, std::string *e
     const auto *v = r.demux->streams[video]->codecpar;
     if (v->width <= 0 || v->height <= 0 || v->width > 3840 || v->height > 2160)
         return fail("This video's resolution is not supported.");
-    if (avformat_alloc_output_context2(&r.mux, nullptr, "mpegts", nullptr) < 0 || !r.mux)
-        return fail("The video transport could not start.");
+    if (v->codec_id == AV_CODEC_ID_VP9 && v->profile != AV_PROFILE_UNKNOWN && v->profile != 0)
+        return fail("This video needs VP9 profile 0.");
     // Give video, audio and separate subtitle packets one explicit timeline.
     // A positive lead-in accommodates normal B-frame decoding timestamps.
     const auto origin = r.demux->start_time == AV_NOPTS_VALUE ? INT64_C(0) : r.demux->start_time;
     if (origin < -INT64_MAX / 4 || origin > INT64_MAX / 4)
         return fail("This video's timestamps are not supported.");
+    MediaTimeline timeline;
+    if (r.demux->duration > 0 && r.demux->duration < INT64_MAX / 4)
+        timeline.duration_us = r.demux->duration;
+    timeline.seekable = timeline.duration_us > 0 && (input.seek || hls);
+    for (unsigned i = 0; i < r.demux->nb_chapters && timeline.chapters.size() < 128; ++i)
+    {
+        const auto *chapter = r.demux->chapters[i];
+        if (!chapter || chapter->time_base.num <= 0 || chapter->time_base.den <= 0)
+            continue;
+        const auto position =
+            av_rescale_q(chapter->start, chapter->time_base, AVRational{1, AV_TIME_BASE});
+        if (position < 0 || position > INT64_MAX / 4 ||
+            (timeline.duration_us && position >= timeline.duration_us))
+            continue;
+        MediaChapter item{position, {}};
+        if (const auto *title = av_dict_get(chapter->metadata, "title", nullptr, 0))
+            item.title.assign(title->value, strnlen(title->value, 128));
+        timeline.chapters.push_back(std::move(item));
+    }
+    std::stable_sort(timeline.chapters.begin(), timeline.chapters.end(),
+                     [](const auto &a, const auto &b) { return a.position_us < b.position_us; });
+    if (output.timeline)
+        output.timeline(output.context, timeline);
+    if (start_us)
+    {
+        if (!timeline.seekable)
+            return fail("This video does not support seeking.");
+        const auto target = origin + std::min(start_us, timeline.duration_us - 1);
+        // The TS demuxer's timestamp index marks every packet as a keyframe.
+        // Locate a real preceding random-access picture before starting a fresh decoder.
+        const bool transport = !strcmp(r.demux->iformat->name, "mpegts");
+        const auto probe = transport ? std::max(origin, target - INT64_C(30000000)) : target;
+        if (avformat_seek_file(r.demux, -1, INT64_MIN, probe, probe, AVSEEK_FLAG_BACKWARD) < 0)
+            return r.cancelled() ? 1 : fail("The video could not seek to that position.");
+        if (transport)
+        {
+            AVPacket *packet = av_packet_alloc();
+            if (!packet)
+                return fail("Not enough memory to seek this video.");
+            std::int64_t position = -1;
+            std::uint64_t scanned = 0;
+            while (!r.cancelled() && scanned < UINT64_C(268435456) &&
+                   av_read_frame(r.demux, packet) >= 0)
+            {
+                scanned += static_cast<unsigned>(std::max(0, packet->size));
+                bool past = false;
+                if (packet->stream_index == video && packet->pts != AV_NOPTS_VALUE)
+                {
+                    const auto pts = av_rescale_q(packet->pts, r.demux->streams[video]->time_base,
+                                                  AVRational{1, AV_TIME_BASE});
+                    if ((packet->flags & AV_PKT_FLAG_KEY) && packet->pos >= 0 && pts <= target)
+                        position = packet->pos;
+                    past = pts > target;
+                }
+                av_packet_unref(packet);
+                if (past)
+                    break;
+            }
+            av_packet_free(&packet);
+            if (r.cancelled())
+                return 1;
+            if (position < 0 || av_seek_frame(r.demux, -1, position, AVSEEK_FLAG_BYTE) < 0)
+                return fail("No nearby keyframe was found for this position.");
+        }
+    }
     const auto timestamp_offset = INT64_C(2000000) - origin;
+    const auto shift = [](std::int64_t &stamp, std::int64_t delta)
+    {
+        if (stamp == AV_NOPTS_VALUE)
+            return true;
+        if ((delta > 0 && stamp > INT64_MAX - delta) || (delta < 0 && stamp < INT64_MIN - delta))
+            return false;
+        stamp += delta;
+        return stamp != AV_NOPTS_VALUE;
+    };
+    if (v->codec_id == AV_CODEC_ID_VP9)
+    {
+        r.packet = av_packet_alloc();
+        if (!r.packet)
+            return fail("Not enough memory to read this video.");
+        int result = AVERROR_EOF;
+        while (!r.cancelled() && (result = av_read_frame(r.demux, r.packet)) >= 0)
+        {
+            if (r.packet->stream_index == video)
+            {
+                if (r.packet->size <= 0 || r.packet->size > 8 * 1024 * 1024 ||
+                    r.packet->pts == AV_NOPTS_VALUE)
+                    return fail("This VP9 video packet is not supported.");
+                auto pts = av_rescale_q(r.packet->pts, r.demux->streams[video]->time_base,
+                                        AVRational{1, AV_TIME_BASE});
+                if (!shift(pts, timestamp_offset) || pts < 0)
+                    return fail("This video's timestamps are not supported.");
+                const MediaVp9Packet packet{r.packet->data,
+                                            static_cast<std::size_t>(r.packet->size),
+                                            static_cast<std::uint64_t>(pts),
+                                            static_cast<std::uint32_t>(v->width),
+                                            static_cast<std::uint32_t>(v->height),
+                                            (r.packet->flags & AV_PKT_FLAG_KEY) != 0};
+                if (!output.vp9_packet(output.context, packet))
+                    return r.cancelled() ? 1 : fail("The VP9 video could not continue playing.");
+            }
+            av_packet_unref(r.packet);
+        }
+        if (r.cancelled())
+            return 1;
+        return result == AVERROR_EOF ? 0 : fail("The video download ended unexpectedly.");
+    }
+    if (avformat_alloc_output_context2(&r.mux, nullptr, "mpegts", nullptr) < 0 || !r.mux)
+        return fail("The video transport could not start.");
     r.mux->output_ts_offset = timestamp_offset;
     r.mux->avoid_negative_ts = AVFMT_AVOID_NEG_TS_DISABLED;
     buffer = static_cast<std::uint8_t *>(av_malloc(kBufferBytes));
@@ -684,15 +795,6 @@ int ReadMedia(const MediaInput &input, const MediaOutput &output, std::string *e
     };
     std::vector<Clock> clocks(mapping.size());
     std::int64_t discontinuity_offset = 0;
-    const auto shift = [](std::int64_t &stamp, std::int64_t delta)
-    {
-        if (stamp == AV_NOPTS_VALUE)
-            return true;
-        if ((delta > 0 && stamp > INT64_MAX - delta) || (delta < 0 && stamp < INT64_MIN - delta))
-            return false;
-        stamp += delta;
-        return stamp != AV_NOPTS_VALUE;
-    };
     struct PendingSubtitle
     {
         unsigned id;

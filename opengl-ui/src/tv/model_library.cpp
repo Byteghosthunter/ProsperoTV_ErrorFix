@@ -65,6 +65,7 @@ const SavedSource *Model::saved_source(std::int64_t id) const
 
 void Model::select_source_record(const SavedSource &source)
 {
+    end_search();
     const bool changed = selected_source_id_ != source.id;
     selected_source_id_ = source.id;
     active_source_ = static_cast<iptv::SourceKind>(source.kind);
@@ -378,6 +379,10 @@ bool Model::play_vod(unsigned index)
     if (vod_.kind() == VodKind::series || pin_prompt() || !vod_allowed(index))
         return false;
     const auto item = vod_.catalog()[index];
+    return queue_vod(item, vod_.kind() == VodKind::episodes ? vod_.series() : std::string());
+}
+bool Model::queue_vod(const iptv::ChannelView &item, const std::string &series)
+{
     sleep_timer.wake();
     play_request_ = {};
     play_request_.channel_id = item.id;
@@ -390,9 +395,41 @@ bool Model::play_vod(unsigned index)
     play_request_.user_agent = item.http_user_agent;
     play_request_.referrer = item.http_referrer;
     play_request_.record_channel_result = false;
+    play_request_.on_demand = true;
+    play_request_.start_position_us = library_.playback_progress(item.id).first;
+    play_request_.series_id = series;
     play_requested_ = true;
     return true;
 }
+bool Model::save_vod_progress(std::string_view id, std::uint64_t position_us,
+                              std::uint64_t duration_us)
+{
+    return library_.save_playback_progress(id, position_us, duration_us);
+}
+
+bool Model::finish_vod(const PlayRequest &request, std::uint64_t position_us,
+                       std::uint64_t duration_us, bool completed)
+{
+    if (!request.on_demand)
+        return false;
+    if (!save_vod_progress(request.channel_id, completed ? 0 : position_us, duration_us))
+        notify(Level::error, tr("Playback position could not be saved"), "");
+    if (!completed || sleep_timer.sleeping() || vod_.kind() != VodKind::episodes ||
+        request.series_id != vod_.series())
+        return false;
+    const auto &catalog = vod_.catalog();
+    const auto current = catalog.Find(request.channel_id);
+    if (current == iptv::Catalog::npos)
+        return false;
+    unsigned next = static_cast<unsigned>(catalog.size());
+    for (unsigned i = 0; i < catalog.size(); ++i)
+        if (catalog[i].source_line > catalog[current].source_line &&
+            (next == catalog.size() || catalog[i].source_line < catalog[next].source_line))
+            next = i;
+    // Do not skip a locked episode to autoplay something later in the series.
+    return next < catalog.size() && play_vod(next);
+}
+
 bool Model::ask_vod_query()
 {
     if (!keyboard_ready_)
@@ -477,8 +514,8 @@ void Model::mark_visibility()
                 if (!group.empty() && group != channel.group_title)
                     ++categories[std::string(group)];
         }
-        bool hidden =
-            !allowed || (hide_failed_ && channel.playback_status == iptv::PlaybackStatus::failed);
+        bool hidden = !allowed || hidden_channels_.contains(std::string(channel.id)) ||
+                      (hide_failed_ && channel.playback_status == iptv::PlaybackStatus::failed);
         if (!hidden_categories_.empty())
         {
             hidden = hidden || category_hidden(channel.group_title);
@@ -490,6 +527,94 @@ void Model::mark_visibility()
     }
     for (auto &[category, count] : categories)
         protected_categories_.push_back({std::move(category), count});
+}
+
+bool Model::move_channel(std::string_view id, int direction)
+{
+    if (group_ == Group::recently_added || group_ == Group::most_watched)
+        return false;
+    if (direction != -1 && direction != 1)
+        return false;
+    const int from = position_of(id);
+    const int to = from + direction;
+    if (from < 0 || to < 0 || to >= static_cast<int>(visible_count_))
+        return false;
+    const bool favorites = group_ == Group::favorites;
+    auto order = favorites ? favorite_order_ : channel_order_;
+    std::erase_if(order,
+                  [&](const auto &saved)
+                  {
+                      const auto at = catalog_.Find(saved);
+                      return at == iptv::Catalog::npos ||
+                             catalog_[at].media_kind != iptv::MediaKind::live;
+                  });
+    std::unordered_set<std::string> known(order.begin(), order.end());
+    for (const auto at : index_.order)
+        if (catalog_[at].media_kind == iptv::MediaKind::live &&
+            (!favorites || is_favorite(catalog_[at])) &&
+            known.insert(std::string(catalog_[at].id)).second)
+            order.emplace_back(catalog_[at].id);
+    const auto neighbor = catalog_[visible_[static_cast<unsigned>(to)]].id;
+    const auto first = std::find(order.begin(), order.end(), id);
+    const auto second = std::find(order.begin(), order.end(), neighbor);
+    if (first == order.end() || second == order.end())
+        return false;
+    std::iter_swap(first, second);
+    if (!library_.save_channel_order(source_id(active_source_), favorites, order))
+        return false;
+    (favorites ? favorite_order_ : channel_order_) = std::move(order);
+    rebuild_visible();
+    return true;
+}
+
+bool Model::reset_channel_order()
+{
+    if (group_ == Group::recently_added || group_ == Group::most_watched)
+        return false;
+    const bool favorites = group_ == Group::favorites;
+    if (!library_.save_channel_order(source_id(active_source_), favorites, {}))
+        return false;
+    (favorites ? favorite_order_ : channel_order_).clear();
+    rebuild_visible();
+    return true;
+}
+
+bool Model::rename_channel(std::string_view id, std::string_view name)
+{
+    const auto at = catalog_.Find(id);
+    if (at == iptv::Catalog::npos || !content_allowed(catalog_[at]) ||
+        catalog_[at].media_kind != iptv::MediaKind::live ||
+        !library_.rename_channel(source_id(active_source_), id, name))
+        return false;
+    channel_names_ = library_.channel_names(source_id(active_source_));
+    index_.build(catalog_, channel_names_);
+    rebuild_visible();
+    return true;
+}
+
+bool Model::hide_channel(std::string_view id, bool hidden)
+{
+    const auto at = catalog_.Find(id);
+    if (at == iptv::Catalog::npos || !content_allowed(catalog_[at]) ||
+        catalog_[at].media_kind != iptv::MediaKind::live ||
+        !library_.hide_channel(source_id(active_source_), id, hidden))
+        return false;
+    hidden_channels_ = library_.hidden_channels(source_id(active_source_));
+    mark_visibility();
+    recount_groups();
+    rebuild_visible();
+    return true;
+}
+
+std::vector<unsigned> Model::hidden_channels() const
+{
+    std::vector<unsigned> result;
+    for (const auto at : index_.order)
+        if (catalog_[at].media_kind == iptv::MediaKind::live &&
+            hidden_channels_.contains(std::string(catalog_[at].id)) &&
+            content_allowed(catalog_[at]))
+            result.push_back(at);
+    return result;
 }
 
 void Model::set_provider_category(std::string_view category)

@@ -515,7 +515,13 @@ TEST_F(AppTest, TheListsAreReachedFromTheTopRow)
     move(Direction::right); // Recent (empty)
     EXPECT_EQ(model_->group(), ptv::Group::recent);
     EXPECT_EQ(model_->visible_count(), 0u);
-    // The chips after Recent are the list's own categories, in its order.
+    move(Direction::right);
+    EXPECT_EQ(model_->group(), ptv::Group::recently_added);
+    EXPECT_EQ(model_->visible_count(), 60u);
+    move(Direction::right);
+    EXPECT_EQ(model_->group(), ptv::Group::most_watched);
+    EXPECT_EQ(model_->visible_count(), 0u);
+    // Provider categories follow the four built-in lists.
     ASSERT_FALSE(model_->provider_categories().empty());
     const std::string first = model_->provider_categories().front().value;
     const unsigned held = model_->provider_categories().front().count;
@@ -529,8 +535,10 @@ TEST_F(AppTest, TheListsAreReachedFromTheTopRow)
     ASSERT_TRUE(model_->take_play_request(&request));
     EXPECT_EQ(request.channel_id, model_->channel(model_->visible(0)).id);
     EXPECT_EQ(model_->view.live_group, ptv::Group::all);
-    // Left twice is All again, and the whole list.
+    // Left four times is All again, and the whole list.
     move(Direction::up);
+    move(Direction::left);
+    move(Direction::left);
     move(Direction::left);
     move(Direction::left);
     EXPECT_TRUE(model_->provider_category().empty());
@@ -541,6 +549,8 @@ TEST_F(AppTest, BackGoesToTheTopThenToTheFirstList)
 {
     move(Direction::up);
     move(Direction::right);
+    move(Direction::right); // Recently added
+    move(Direction::right); // Most watched
     move(Direction::right); // the list's first category
     ASSERT_FALSE(model_->provider_category().empty());
     ASSERT_GT(model_->visible_count(), 6u);
@@ -589,6 +599,19 @@ TEST_F(AppTest, TheSearchDrawerNarrowsTheListBehindIt)
     EXPECT_FALSE(model_->filtering());
     EXPECT_EQ(model_->visible_count(), 60u);
     EXPECT_EQ(app_->tab(), 0);
+}
+
+TEST_F(AppTest, UnifiedSearchResultsOpenTheSelectedLiveChannel)
+{
+    press(Action::north);
+    host::set_keyboard_text("channel 03");
+    press(Action::confirm);
+    press(Action::page_prev);
+    press(Action::confirm);
+    EXPECT_FALSE(app_->searching());
+    ptv::PlayRequest request;
+    ASSERT_TRUE(model_->take_play_request(&request));
+    EXPECT_EQ(request.channel_name, "Channel 03 (576p)");
 }
 
 TEST_F(AppTest, SquareInTheDrawerResetsAndCircleClosesIt)
@@ -987,8 +1010,9 @@ TEST_F(AppTest, ProviderCategoriesAreBrowsableAndCanBeHiddenFromTheController)
     const auto category = model_->provider_categories().front().value;
     press(Action::touch);
     EXPECT_FALSE(app_->accepts_remote_search());
-    press(Action::page_next);
+    press(Action::page_next); // Opens the number pad, never the next main tab.
     EXPECT_EQ(app_->tab(), 0);
+    press(Action::back); // Return to the same provider category list.
     move(Direction::down);
     press(Action::west);
     EXPECT_TRUE(model_->category_hidden(category));
@@ -1737,4 +1761,129 @@ TEST_F(AppTest, AudioNormalizationIsOptionalAndPersists)
     EXPECT_TRUE(app_->take_settings_changed());
     std::ofstream(dir_ + "/prosperotv-interface-v1.txt") << "volume=60\n";
     EXPECT_FALSE(ptv::load_settings(dir_).audio_normalization);
+}
+
+TEST_F(AppTest, AppearanceSettingsPersistAndScreensaverConsumesWakeButton)
+{
+    ptv::Settings settings;
+    settings.theme = 2;
+    settings.larger_text = settings.high_contrast = true;
+    settings.screensaver_minutes = 1;
+    ASSERT_TRUE(ptv::save_settings(dir_, settings));
+    EXPECT_EQ(ptv::load_settings(dir_), settings);
+    app_ = std::make_unique<ptv::App>(*model_, font_set().fonts, 7u, settings, "test");
+    for (int i = 0; i < 61; ++i)
+        app_->update({}, 1, feedback_);
+    ASSERT_TRUE(app_->screensaver_active());
+    app_->draw(frame_);
+    ASSERT_EQ(frame_.scene.instances().size(), 1u);
+    EXPECT_TRUE(frame_.overlay.empty());
+    EXPECT_FALSE(frame_.glass);
+    for (int i = 0; i < 3; ++i)
+        EXPECT_EQ(frame_.scene.instances()[0].color_top[i], 0);
+    press(Action::confirm);
+    EXPECT_FALSE(app_->screensaver_active());
+    ptv::PlayRequest request;
+    EXPECT_FALSE(model_->take_play_request(&request));
+    press(Action::confirm);
+    EXPECT_TRUE(model_->take_play_request(&request));
+    std::ofstream(dir_ + "/prosperotv-interface-v1.txt") << "theme=999\nscreensaver_minutes=-1\n";
+    const auto invalid = ptv::load_settings(dir_);
+    EXPECT_EQ(invalid.theme, 0);
+    EXPECT_EQ(invalid.screensaver_minutes, 5);
+}
+
+TEST_F(AppTest, AppearanceChoicesAreReachableAndChangeTheRenderedPalette)
+{
+    for (int i = 0; i < 4; ++i)
+        press(Action::page_next);
+    for (int i = 0; i < 60 && app_->settings_row() != "Theme"; ++i)
+        move(Direction::down);
+    ASSERT_EQ(app_->settings_row(), "Theme");
+    move(Direction::right);
+    EXPECT_EQ(app_->settings().theme, 1);
+    move(Direction::down);
+    press(Action::confirm);
+    EXPECT_TRUE(app_->settings().larger_text);
+    move(Direction::down);
+    press(Action::confirm);
+    EXPECT_TRUE(app_->settings().high_contrast);
+    EXPECT_EQ(frame_.backdrop.mode, ptv::gfx::BackdropMode::gradient);
+    EXPECT_EQ(frame_.backdrop.colors[0].r, 0);
+    move(Direction::down);
+    move(Direction::left);
+    EXPECT_EQ(app_->settings().screensaver_minutes, 1);
+    move(Direction::left);
+    EXPECT_EQ(app_->settings().screensaver_minutes, 0);
+    for (int i = 0; i < 61; ++i)
+        app_->update({}, 10, feedback_);
+    EXPECT_FALSE(app_->screensaver_active());
+}
+
+TEST_F(AppTest, PictureInPictureKeepsSelectedStreamAndReleasesOtherTiles)
+{
+    host::set_preview(true);
+    ptv::Shared shared(*model_, font_set().fonts, {});
+    ptv::Multiview view(shared);
+    unsigned created = 0, released = 0;
+    view.configure([&](unsigned old, const ptv::ImagePixels &) { return old ? old : ++created; },
+                   [&](unsigned) { ++released; });
+    view.open(std::string(model_->channel(0).id));
+    hui::InputFrame input;
+    input.nav = Direction::right;
+    view.handle(input, feedback_);
+    ASSERT_TRUE(view.choose(std::string(model_->channel(1).id)));
+    const auto settle = [&]
+    {
+        for (int i = 0; i < 30; ++i)
+        {
+            view.update(kDt);
+            EXPECT_LE(view.audible_count(), 1u);
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    };
+    settle();
+    EXPECT_EQ(host::preview_starts(), 2u);
+    input = {};
+    input.pressed = hui::action_bit(Action::touch);
+    view.handle(input, feedback_);
+    ASSERT_TRUE(view.pinned());
+    EXPECT_FALSE(view.is_open());
+    EXPECT_FALSE(view.choosing());
+    settle();
+    EXPECT_EQ(host::preview_starts(), 2u);
+    EXPECT_EQ(host::preview_stops(), 1u);
+    EXPECT_EQ(view.audible_count(), 1u);
+    hui::gfx::DrawList list;
+    hui::ui::Canvas canvas{list, font_set().fonts, 0, 0};
+    view.draw_picture_in_picture(canvas);
+    EXPECT_FALSE(list.empty());
+    view.stop();
+    EXPECT_FALSE(view.pinned());
+    EXPECT_EQ(host::preview_stops(), 2u);
+    EXPECT_EQ(created, released);
+    EXPECT_EQ(view.audible_count(), 0u);
+    host::set_preview(false);
+}
+
+TEST_F(AppTest, PictureInPictureAllowsBrowsingAndGuideWithoutForegroundPlayback)
+{
+    host::set_preview(true);
+    app_->configure_preview([](unsigned old, const ptv::ImagePixels &) { return old ? old : 91u; },
+                            [](unsigned) {});
+    press(Action::l3);
+    press(Action::touch);
+    move(Direction::right);
+    EXPECT_EQ(position(), 1);
+    press(Action::r3);
+    EXPECT_TRUE(app_->guide_open());
+    ptv::PlayRequest request;
+    EXPECT_FALSE(model_->take_play_request(&request));
+    press(Action::back);
+    press(Action::l3);
+    move(Direction::right);
+    EXPECT_EQ(position(), 2);
+    app_->stop_preview();
+    EXPECT_EQ(host::preview_starts(), host::preview_stops());
+    host::set_preview(false);
 }
