@@ -121,3 +121,24 @@ The correction is included in draft PRs #45 and #46. Console acceptance is still
 pending while `.30` runs another title.
 
 - 2026-10-11: idle .30 accepted merged main 958a68d (case 89: 56 deployed files verified; Home/Live/On Demand/Sources/Settings and 11,172-channel catalog) and native status-label fix ac2c4e9 (case 93: all seven tabs correctly identified; 20-second H.264 1920x1080 playback, 493 decoded/473 presented frames, 918 audio frames/3,672 output grains, zero audio/video queue underruns or presentation gaps over 500 ms, clean teardown; services 2121/3232/9021 reachable and no active title). Candidate ELF SHA-256: 505236d6f183e384e8c7a8a4fdd553821dff8797500c9221285ca5adaf3a84ca; evidence: results/integration/console-89 and console-93; disposable no-elevation title: PPSA88306. These bounded checks do not validate 4K, VOD, Auto-quality throttling, physical USB, surround or speech; controlled LAN fixtures remain blocked by inbound Windows firewall access.
+
+## G1/G2: Public catalog scrolling
+
+G1: Keep a full provider category row and the visible channel names in the bounded
+text shaping cache. Verify cached measurement without relying on wall-clock timing.
+G2: Compare Down and held R2/L2 on the public catalog in the same disposable title
+on idle .30; require clean shutdown and service health. Preserve the regular app's data.
+
+- 2026-10-11 | G1 baseline | e707301 | .30 PPSA88308 | reproduced: public catalog Down peaks 310 ms, R2 interval 50.62 ms mean | results/integration/public-scroll-before-30 | validate cache fix
+
+The cache now retains 512 entries and evicts least recently used text; its existing
+64 KiB text and 32,768 glyph limits remain. A wrapped HarfBuzz regression fails with
+FIFO eviction and passes through 1,200 new channel names while reusing 200 categories.
+All 6,203 shaping checks and 13 focused UI ASan/UBSan tests pass, including the
+120,000-channel browsing test. Host public-catalog drawing fell from 17-20 ms to 2-3 ms.
+Native .30 at 3840x2160, with logos and live preview enabled, completed Down and held
+R2/L2 on 11,172 public channels. Scrolling frame windows average 17.27-17.77 ms instead
+of 50.62-52.11 ms; worst scrolling window frames are below 58 ms instead of 310 ms.
+Small frame-time spikes remain; this is not a claim of perfect 60 fps or a network fix.
+
+- 2026-10-11 | G2 | e2637a1 | .30 PPSA88308 | pass: Down/R2/L2, clean close, services healthy | results/integration/public-scroll-final-30 | regular .060 build
