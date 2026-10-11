@@ -15,6 +15,7 @@
 #include "tv/home_screen.hpp"
 #include "tv/backup.hpp"
 #include "tv/multiview.hpp"
+#include "tv/share_sheet.hpp"
 #include "ui/components/dialog.hpp"
 #include "ui/components/form.hpp"
 #include "ui/components/tabs.hpp"
@@ -49,13 +50,15 @@ class App
     }
     void configure_preview(LivePreview::Upload upload, ImageCache::Release release)
     {
-        shared_.preview.configure(upload, release);
+        shared_.preview.configure(upload, release, false,
+                                  [this] { return shared_.model.viewing_tick(true); });
         multiview_.configure(std::move(upload), std::move(release));
     }
     void stop_preview()
     {
         shared_.preview.clear();
         multiview_.stop();
+        (void)shared_.model.viewing_tick(false);
     }
     bool screensaver_active() const
     {
@@ -91,7 +94,7 @@ class App
     }
     bool storage_open() const
     {
-        return storage_dialog_.is_open();
+        return storage_dialog_.is_open() || share_sheet_.is_open();
     }
     // A sandboxed test title can supply its own fixture mount directory.
     void set_usb_root(std::string root)
@@ -222,6 +225,7 @@ class App
     SearchSheet search_;
     LibrarySheet library_sheet_;
     GuideSheet guide_sheet_;
+    ShareSheet share_sheet_;
     ui::TabBar tabs_;
     ui::Form form_;
     ui::Dialog failure_;

@@ -276,3 +276,85 @@ exclusive output ownership and defined volume/normalization/speed behavior. The 
 [findings](https://github.com/sainsaji/PS5-Audio-Passthrough-Research/blob/c3be9c2afcb8f7838784ead0fe1c12a2ceea965a/docs/FINDINGS.md)
 also report unresolved receiver lockups after repeated format changes. No surround setting,
 new dependency or console probe was added for this investigation.
+### Explicit source checking (host implementation; native acceptance pending)
+
+Sources offers a Check/Cancel active source row after saved sources, with passed/failed/skipped totals.
+Only visible, permitted live channels are checked. One muted preview connection runs at a time,
+with a 15-second channel budget and one second between channels. Actual decoded pictures pass;
+HTTP 200 and decoder-open alone do not. A channel fails only when all entry URLs return 404/410.
+Missing HLS segments, unsupported codecs/containers, timeouts and interrupted checks never mark
+a channel failed. HTTP 401/403/429/5xx and portal resolution failures stop the batch. Full playback,
+previews/PiP, recordings, source changes, refreshes and parental prompts stop checks before taking
+those resources. No automatic mass checking or restart occurs.
+
+Results use separate per-source .checks.sqlite3 files next to catalogues, bounded to 250,000 rows
+and 64 MiB. Up to 32 results commit together, or after five seconds; cancellation flushes completed
+results. Inconclusive checks preserve prior confirmed health. Source/account/request-header identity,
+channel URL fingerprints and timestamps prevent cross-source or stale overlays. Newer manual
+playback history wins. These files never replace or evict normal playback history. Tests exercise
+classification, first-frame evidence, cancellation, policy changes, batching, caps and precedence.
+Preview codec coverage remains narrower than full playback; skipped counts make this explicit.
+Physical console decoder/provider acceptance is pending, so the roadmap remains unchecked.
+### Kids viewing limits (host implementation; native verification pending)
+
+The current console profile can set a daily viewing-session allowance and a bedtime/wake
+window in Settings after unlocking the parent PIN. Limits apply only in kids mode and
+remain active during a session PIN unlock. Turning kids mode off requires that unlock.
+The displayed wake time starts each allowance day. The console's local clock is displayed
+beside the controls; an overnight bedtime window does not reopen at midnight.
+
+Session time includes pauses, buffering, tuning and visible previews. A mosaic or PiP
+session counts once, not once per channel. Menu browsing, source health checks and background
+recording do not consume viewing time. All normal playback requests, phone-selected channels,
+Home resumes, automatic episode continuation and quality switches share the same check.
+
+Allowance accounting reserves at most 30 seconds in the profile's atomic parental file
+before viewing. An orderly stop returns whole unused seconds; a crash/power loss can lose
+up to 30 seconds. Reopening cannot recover a committed reservation. Backup stops preview
+sessions and settles their reservation before copying settings. Invalid settings or failed
+usage writes block viewing rather than resetting the allowance.
+
+The console clock is not trusted time. Missing/invalid time or a backward jump exceeding
+two minutes blocks configured limits; repeating a local day never resets its allowance.
+A forward clock change across app restarts cannot be distinguished reliably from elapsed
+time; backward changes that stay after the last persisted clock observation can also go
+undetected after a restart. This is a household convenience, not tamper-proof enforcement against a user with
+console clock or profile-file access. Native local timezone/DST and real playback stop
+behavior still require console testing. No roadmap completion box has been changed.
+
+## Fatal-signal crash reports
+
+The app preopens a profile-local 32-byte record before starting application workers.
+Default fatal handlers for ABRT, BUS, FPE, ILL and SEGV record only signal/code, coarse
+startup/menu/playback phase and time, then preserve the operating system's fatal action.
+Existing platform handlers are left alone. No account, stream address, stack or memory
+contents enter the record. A normal close leaves no crash report.
+
+The next launch atomically saves a redacted failure report, shows where to export it in
+Settings and skips automatic last-channel playback for that launch. Failed recovery
+preserves the pending record. The report omits the app version because the crashing
+binary might have been replaced before recovery. The existing USB export sanitizer
+allows only the new numeric crash fields, alongside playback diagnostics.
+
+`opengl-ui/tools/check-crash-report.sh` passes 114 unsanitized host checks, including
+all five signals, preserved termination, custom/ignored handlers and malformed files.
+Capture is best effort: stack exhaustion, forced termination, power loss and hangs may
+produce no record; a blocked filesystem may delay a fatal handler. Native signal
+delivery and export still require console validation. No console crash was induced.
+
+Integrated validation at `ba9182a`: the PS5 application links successfully (40,287,388-byte
+ELF, SHA-256 `eef0c65391ece71c5dee35b404ed1b8579e64ff1159ea4856edc63a82380fb31`),
+with evidence in `results/integration/console-81`. The 251-test sanitizer run passed
+250 tests; editing a translation during compilation left its implementation object stale.
+Rebuilding the stable tree passed all six targeted translation, report-redaction and
+source-check tests. The additional checker/viewing-allowance integration regression
+passes in the root tree and proves checks preserve the parental file byte for byte,
+including after quota exhaustion. The latest console preflight found `PPSA99008_000`
+running, so this candidate has not been installed or exercised on the console.
+
+The subsequent sharing integration passes all 262 UI sanitizer tests on a stable
+source tree. The complete static-analysis run identified a quality-candidate count
+initialization path; resetting the builder's count explicitly resolves it and the
+affected translation unit passes its rerun. Formatting, metadata and asset lint
+passes all 136 attributed files. Encrypted sharing and its SDK build evidence are
+described in [CONSOLE_SHARING.md](CONSOLE_SHARING.md).

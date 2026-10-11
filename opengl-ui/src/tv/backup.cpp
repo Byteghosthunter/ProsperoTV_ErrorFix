@@ -2,6 +2,10 @@
 // Copyright (C) 2026 BlackBearReloaded
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "tv/backup.hpp"
+#include "tv/share_bundle.hpp"
+#include "iptv_user_state.h"
+#include <algorithm>
+#include <unordered_set>
 #include <sqlite3.h>
 #include <zlib.h>
 #include <array>
@@ -36,7 +40,9 @@ using Files = std::array<File, kNames.size()>;
 
 bool regular(const std::string &path, std::size_t limit, bool &exists)
 {
-    struct stat status{};
+    struct stat status
+    {
+    };
     exists = false;
     if (lstat(path.c_str(), &status) != 0)
         return errno == ENOENT;
@@ -253,13 +259,17 @@ std::vector<std::string> usb_drives(const std::string &mount_root)
     // is plugged in. With nothing mounted a folder belongs to the same
     // filesystem as the one that holds it: offering it as a drive would put
     // a "backup" on the console's own storage and call it saved.
-    struct stat parent{};
+    struct stat parent
+    {
+    };
     const bool parent_known = stat(mount_root.empty() ? "/" : mount_root.c_str(), &parent) == 0;
 #endif
     for (unsigned i = 0; i < 8; ++i)
     {
         const auto path = mount_root + "/usb" + std::to_string(i);
-        struct stat status{};
+        struct stat status
+        {
+        };
         // The actual operation checks read/write access and reports failures.
         // access() is not a reliable availability probe in the console sandbox.
         if (lstat(path.c_str(), &status) != 0 || !S_ISDIR(status.st_mode))
@@ -357,6 +367,81 @@ bool restore_settings(const std::string &directory, const std::string &archive, 
     return true;
 }
 
+bool import_shared_library(const std::string &directory, const SharedLibrary &library,
+                           std::string &error)
+{
+    std::string validated;
+    if (!encode_shared_library(library, validated))
+    {
+        error = "The shared library is invalid. No settings were changed.";
+        return false;
+    }
+    Files before;
+    if (!recover_settings(directory, error))
+        return false;
+    if (!read_files(directory, before) || !before[1].present ||
+        !write_archive(directory + kJournal, before))
+    {
+        error = "The current profile could not be protected. No settings were changed.";
+        return false;
+    }
+    Library destination;
+    bool ok = destination.open(directory + "/prosperotv-library.sqlite3");
+    auto existing = destination.sources();
+    // IDs 1..4 are installation migration slots; imported sources always get new IDs.
+    ok = ok && std::any_of(existing.begin(), existing.end(),
+                           [](const SavedSource &source) { return source.id == 4; });
+    for (const auto &item : library.sources)
+    {
+        if (!ok)
+            break;
+        const auto duplicate =
+            std::find_if(existing.begin(), existing.end(), [&](const SavedSource &source)
+                         { return same_shared_source(source, item.source); });
+        // Existing accounts keep their destination HTTP/guide preferences.
+        if (duplicate != existing.end())
+            continue;
+        auto source = item.source;
+        source.id = 0;
+        ok = destination.save_source(&source) && destination.set_guide_url(source.id, item.guide);
+        for (const auto &[channel, guide] : item.mapping)
+            ok = ok && destination.set_guide_mapping(source.id, channel, guide);
+        existing.push_back(std::move(source));
+    }
+    auto folders = destination.folders();
+    for (const auto &[name, ids] : library.folders)
+    {
+        if (ok && std::find(folders.begin(), folders.end(), name) == folders.end())
+            ok = destination.add_folder(name);
+        for (const auto &id : ids)
+            ok = ok && destination.put_in_folder(name, id, true);
+    }
+    ok = destination.close() && ok;
+    std::vector<std::string> favorites;
+    const auto favorite_path = directory + "/iptv-favorites-v1.bin";
+    const auto loaded = iptv::LoadFavorites(favorite_path, &favorites);
+    ok = ok && (loaded == iptv::UserStateStatus::ok || loaded == iptv::UserStateStatus::not_found);
+    std::unordered_set<std::string> seen(favorites.begin(), favorites.end());
+    for (const auto &id : library.favorites)
+        if (seen.insert(id).second)
+            favorites.push_back(id);
+    if (ok)
+        ok = iptv::SaveFavorites(favorite_path, favorites) == iptv::UserStateStatus::ok;
+    if (!ok)
+    {
+        if (recover_settings(directory, error))
+            error = "Import failed. Your previous profile was restored.";
+        return false;
+    }
+    if (std::remove((directory + kJournal).c_str()) != 0)
+    {
+        error = "Import could not be committed. Restart to recover your previous profile.";
+        return false;
+    }
+    error.clear();
+    return true;
+}
+
 namespace
 {
 std::string sanitize_report(std::string_view receipt)
@@ -365,6 +450,9 @@ std::string sanitize_report(std::string_view receipt)
     // Only known numeric decoder/network fields leave the console. Free-form
     // provider responses, channel names, URLs, account details and logs do not.
     constexpr std::array fields = {"version",
+                                   "crash_signal",
+                                   "crash_code",
+                                   "crash_phase",
                                    "unix_time",
                                    "result",
                                    "attempts",

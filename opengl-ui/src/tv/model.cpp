@@ -351,6 +351,7 @@ bool Model::open()
         // is read again.
         (void)iptv::LoadPlaybackResults(path("prosperotv-playback-history.sqlite3"),
                                         catalog_.source_id, &catalog_);
+        load_source_checks();
         mark_visibility();
         mark_lists();
         recount_groups();
@@ -384,6 +385,8 @@ bool Model::open()
 
 void Model::close()
 {
+    cancel_source_check();
+    (void)viewing_tick(false);
     cancel_home_play();
     home_series_.stop();
     clear_pin();
@@ -434,6 +437,7 @@ bool Model::close_for_storage()
 void Model::poll()
 {
     poll_programme_jobs();
+    poll_source_check();
     check_sleep_timer();
     if (keyboard_ready_)
         iptv_ime_poll();
@@ -483,6 +487,7 @@ void Model::load_cache()
     if (catalog_loaded_)
         (void)iptv::LoadPlaybackResults(path("prosperotv-playback-history.sqlite3"), wanted,
                                         &catalog_);
+    load_source_checks();
     const bool own = active_source_ != iptv::SourceKind::BuiltIn;
     health_[static_cast<unsigned>(active_source_)] = catalog_loaded_ ? SourceHealth::cached
                                                      : own           ? SourceHealth::saved
@@ -911,6 +916,10 @@ Model::Starred Model::toggle_favorite(unsigned catalog_index)
 
 std::optional<PlayRequest> Model::preview_request(std::string_view channel_id) const
 {
+    return playback_allowed() ? probe_request(channel_id) : std::nullopt;
+}
+std::optional<PlayRequest> Model::probe_request(std::string_view channel_id) const
+{
     if (sleep_timer.sleeping())
         return {};
     const auto index = catalog_.Find(channel_id);
@@ -968,6 +977,8 @@ std::optional<unsigned> Model::previous_channel(std::string_view current) const
 
 bool Model::play(unsigned catalog_index)
 {
+    if (!playback_allowed())
+        return false;
     if (catalog_index >= channel_count() || pin_prompt() ||
         hidden_channels_.contains(std::string(catalog_[catalog_index].id)) ||
         catalog_[catalog_index].media_kind != iptv::MediaKind::live ||
@@ -1027,6 +1038,12 @@ bool Model::play(unsigned catalog_index)
 
 bool Model::take_play_request(PlayRequest *request)
 {
+    if (!playback_allowed())
+    {
+        play_requested_ = false;
+        play_request_ = {};
+        return false;
+    }
     if (request == nullptr || !play_requested_)
         return false;
     *request = std::move(play_request_);
@@ -1346,6 +1363,7 @@ void Model::apply_account_password(const char *password)
 
 void Model::refresh()
 {
+    cancel_source_check("Check stopped for source refresh");
     cancel_home_play();
     end_search();
     vod_.stop();
@@ -1454,7 +1472,8 @@ void Model::run_refresh()
     if (pending_network_ == iptv::http::Status::ok && !stopping())
     {
         const iptv::http::RequestControl control{
-            [](void *context) {
+            [](void *context)
+            {
                 return static_cast<const Model *>(context)->stop_requested_.load(
                     std::memory_order_acquire);
             },
@@ -1720,6 +1739,7 @@ void Model::consume_refresh()
         saved_unix_ = pending_saved_ ? platform::unix_time() : 0;
         (void)iptv::LoadPlaybackResults(path("prosperotv-playback-history.sqlite3"),
                                         catalog_.source_id, &catalog_);
+        load_source_checks();
         adopt_catalog();
         next_guide_check_ = 0;
         if (has_failure_)

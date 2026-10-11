@@ -28,7 +28,9 @@
 #include "platform/ps5/system.hpp"
 #include "tv/app.hpp"
 #include "tv/diag.hpp"
+#include "tv/crash_report.hpp"
 #include "tv/i18n.hpp"
+#include <atomic>
 #include "tv/remote_input.hpp"
 #include "tv_build_options.h"
 #include "tv_dev.hpp"
@@ -319,6 +321,10 @@ struct StorageJob
             job.ok = ptv::backup_settings(tv::storage::config_dir(), archive, job.error);
         else if (job.request.action == ptv::StorageAction::restore)
             job.ok = ptv::restore_settings(tv::storage::config_dir(), archive, job.error);
+        else if (job.request.action == ptv::StorageAction::share_import &&
+                 job.request.shared_library)
+            job.ok = ptv::import_shared_library(tv::storage::config_dir(),
+                                                *job.request.shared_library, job.error);
         else
             job.ok = ptv::export_failure_report(
                 tv::storage::logs_dir(), job.request.drive + "/ProsperoTV-failure.txt", job.error);
@@ -523,7 +529,7 @@ bool run_menu(ptv::Model &model, ptv::Settings *settings, const LastPlayback &la
                                               static_cast<std::uint64_t>(now));
             iptv_remote_enable_search(!resolving_portal && app.accepts_remote_search());
             iptv_remote_set_sources_handler(
-                resolving_portal || app.storage_busy()
+                resolving_portal || app.storage_busy() || app.storage_open()
                     ? nullptr
                     : +[](const char *input, size_t bytes, char *out, size_t capacity,
                           void *context) -> int
@@ -541,7 +547,7 @@ bool run_menu(ptv::Model &model, ptv::Settings *settings, const LastPlayback &la
                 },
                 &model);
             iptv_remote_set_browse_handler(
-                resolving_portal || app.storage_busy()
+                resolving_portal || app.storage_busy() || app.storage_open()
                     ? nullptr
                     : +[](const char *input, size_t bytes, char *out, size_t capacity,
                           void *context) -> int
@@ -775,6 +781,8 @@ bool run_menu(ptv::Model &model, ptv::Settings *settings, const LastPlayback &la
                                             ? "Backup restored."
                                         : storage.request.action == ptv::StorageAction::backup
                                             ? "Backup saved to USB."
+                                        : storage.request.action == ptv::StorageAction::share_import
+                                            ? "Sources and favorites imported."
                                             : "Failure report saved to USB."
                                       : storage.error;
                 break;
@@ -1207,6 +1215,20 @@ int main()
         profile_name[sizeof(profile_name) - 1] = '\0';
         g_profile_name = profile_name;
     }
+    // Recover before truncating, and install before the first application worker starts.
+    const auto crash_path = tv::storage::logs_dir() + "/prosperotv-crash.pending";
+    ptv::crash::Record crash_record;
+    const auto crash_status = ptv::crash::read(crash_path, crash_record);
+    const bool recovered_crash = crash_status == ptv::crash::Read::record;
+    bool crash_saved = !recovered_crash;
+    if (recovered_crash)
+        crash_saved = save::write_atomic(
+            tv::storage::logs_dir() + "/prosperotv-last-failure.txt",
+            ptv::failure_report(crash_record.receipt(), {}, crash_record.timestamp, -1, 0)).empty();
+    if (crash_status != ptv::crash::Read::error && crash_saved)
+        say("[TV] crash recorder: %s", ptv::crash::install(crash_path) ? "ready" : "unavailable");
+    else
+        say("[TV] crash recorder: previous record could not be read or saved");
     iptv_remote_set_pairing_store((tv::storage::config_dir() + "/phone-pairing-v1.txt").c_str());
     iptv_remote_set_icon(tv::storage::app_file("sce_sys/icon0.png").c_str());
     const bool remote_started = iptv_remote_start(8888);
@@ -1245,6 +1267,8 @@ int main()
     }
     auto owned_model =
         std::make_unique<ptv::Model>(tv::storage::config_dir(), tv::storage::cache_dir());
+    if (recovered_crash)
+        owned_model->resume_last(false);
     ptv::Settings settings = ptv::load_settings(tv::storage::config_dir());
     // The diagnostic log: the viewer's switch in Settings, a debug build, or
     // (test title) a dev/diagnostics.txt left beside the app.
@@ -1299,12 +1323,17 @@ int main()
     }
     tv::start_update_check();
     LastPlayback last;
-    std::string menu_notice;
+    std::string menu_notice =
+        recovered_crash
+            ? ptv::tr(crash_saved ? "The previous session crashed. Export its report from Settings."
+                                  : "The previous session crashed. Automatic playback was skipped.")
+            : "";
     std::optional<ptv::PlayRequest> next_channel;
     std::optional<ptv::PlaybackResume> next_resume;
     std::optional<iptv_hls_quality_t> next_quality;
     for (;;)
     {
+        ptv::crash::phase(ptv::crash::Phase::menu);
         ptv::Model &model = *owned_model;
         ptv::PlayRequest request;
         const auto resume = std::move(next_resume);
@@ -1348,6 +1377,15 @@ int main()
             last = {};
             continue;
         }
+
+        if (!model.viewing_tick(true))
+        {
+            const auto *reason = model.parental().viewing_reason(ptv::platform::unix_time());
+            menu_notice = reason ? ptv::tr(reason) : ptv::tr("Viewing is unavailable");
+            (void)model.viewing_tick(false);
+            continue;
+        }
+        std::atomic<bool> viewing_blocked{false};
 
         // The menu's display and the player's must never overlap: give the
         // closed one a moment to let go.
@@ -1403,80 +1441,88 @@ int main()
             ptv::PlaybackOsd *osd;
             ptv::Settings *settings;
             ptv::RemoteBrowseView *phone;
-        } input_context{&controls, &settings, &phone};
+            ptv::Model *model;
+            std::atomic<bool> *viewing_blocked;
+            bool osd_ready;
+        } input_context{&controls, &settings, &phone, &model, &viewing_blocked, osd_ready};
+        iptv_player_set_controls(
+            [](void *context, int action) -> int
+            {
+                auto &input = *static_cast<PlaybackControlsContext *>(context);
+                if (input.model->viewing_control() == 2)
+                {
+                    *input.viewing_blocked = true;
+                    return 2;
+                }
+                if (!input.phone->selected.empty())
+                    return 2;
+                if (!input.osd_ready)
+                    return 0;
+                auto &osd = *input.osd;
+                iptv_player_audio_state_t audio{};
+                iptv_player_audio_state(&audio);
+                osd.set_audio_state(audio);
+                iptv_player_quality_state_t quality{};
+                iptv_player_quality_state(&quality);
+                osd.set_quality_state(quality);
+                const auto subtitle_state = iptv::player_subtitles().state();
+                osd.set_subtitle_state(subtitle_state);
+                iptv_player_live_state_t live{};
+                iptv_player_live_state(&live);
+                osd.set_live_state(live);
+                iptv_player_media_state_t media{};
+                iptv_player_media_state(&media);
+                osd.set_media_state(media);
+                if (media.available)
+                    osd.set_paused(media.paused != 0);
+                if (TV_DEV_SCRIPTS != 0)
+                {
+                    static std::uint64_t last_sample = 0;
+                    const auto now = ptv::platform::monotonic_us();
+                    if (now - last_sample >= 1000000)
+                    {
+                        last_sample = now;
+                        say("[TV] playback-tracks audio=%u count=%u pending=%u result=%d "
+                            "disabled=%u subtitle=%u count=%zu error=%d",
+                            audio.selected_pid, audio.count, audio.pending, audio.result,
+                            audio.disabled, subtitle_state.selected, subtitle_state.tracks.size(),
+                            static_cast<int>(subtitle_state.error));
+                        if (live.available)
+                            say("[TV] live-history first=%llu last=%llu position=%llu "
+                                "paused=%u "
+                                "expired=%u audio=%u audio_track=%u subtitle_track=%u",
+                                static_cast<unsigned long long>(live.first_us),
+                                static_cast<unsigned long long>(live.last_us),
+                                static_cast<unsigned long long>(live.position_us), live.paused,
+                                live.expired, audio.selected_pid,
+                                audio.count ? audio.tracks[0].pid : 0u,
+                                subtitle_state.tracks.empty() ? 0u : subtitle_state.tracks[0].id);
+                    }
+                }
+                const int handled = osd.input(action, ptv::platform::monotonic_us());
+                if (const auto position = osd.take_media_seek())
+                    (void)iptv_player_seek_media(*position);
+                if (const auto speed = osd.take_media_speed())
+                    (void)iptv_player_set_speed(*speed);
+                if (const auto paused = osd.take_media_pause())
+                    (void)iptv_player_pause_media(*paused);
+                if (const auto selected = osd.take_picture_selection())
+                    iptv_native_agc_set_picture_mode(*selected);
+                if (const auto delay = osd.take_audio_delay())
+                    iptv_player_set_audio_delay(*delay);
+                if (osd.copy_picture_settings(*input.settings))
+                    ptv::save_settings(tv::storage::config_dir(), *input.settings);
+                if (const auto selected = osd.take_audio_selection())
+                    (void)iptv_player_select_audio(*selected);
+                if (const auto selected = osd.take_subtitle_selection())
+                    (void)iptv::player_subtitles().select(*selected);
+                if (TV_DEV_SCRIPTS != 0 && action >= 0)
+                    say("[TV] playback control action=%d handled=%d", action, handled);
+                return handled;
+            },
+            &input_context);
         if (osd_ready)
         {
-            iptv_player_set_controls(
-                [](void *context, int action) -> int
-                {
-                    auto &input = *static_cast<PlaybackControlsContext *>(context);
-                    if (!input.phone->selected.empty())
-                        return 2;
-                    auto &osd = *input.osd;
-                    iptv_player_audio_state_t audio{};
-                    iptv_player_audio_state(&audio);
-                    osd.set_audio_state(audio);
-                    iptv_player_quality_state_t quality{};
-                    iptv_player_quality_state(&quality);
-                    osd.set_quality_state(quality);
-                    const auto subtitle_state = iptv::player_subtitles().state();
-                    osd.set_subtitle_state(subtitle_state);
-                    iptv_player_live_state_t live{};
-                    iptv_player_live_state(&live);
-                    osd.set_live_state(live);
-                    iptv_player_media_state_t media{};
-                    iptv_player_media_state(&media);
-                    osd.set_media_state(media);
-                    if (media.available)
-                        osd.set_paused(media.paused != 0);
-                    if (TV_DEV_SCRIPTS != 0)
-                    {
-                        static std::uint64_t last_sample = 0;
-                        const auto now = ptv::platform::monotonic_us();
-                        if (now - last_sample >= 1000000)
-                        {
-                            last_sample = now;
-                            say("[TV] playback-tracks audio=%u count=%u pending=%u result=%d "
-                                "disabled=%u subtitle=%u count=%zu error=%d",
-                                audio.selected_pid, audio.count, audio.pending, audio.result,
-                                audio.disabled, subtitle_state.selected,
-                                subtitle_state.tracks.size(),
-                                static_cast<int>(subtitle_state.error));
-                            if (live.available)
-                                say("[TV] live-history first=%llu last=%llu position=%llu "
-                                    "paused=%u "
-                                    "expired=%u audio=%u audio_track=%u subtitle_track=%u",
-                                    static_cast<unsigned long long>(live.first_us),
-                                    static_cast<unsigned long long>(live.last_us),
-                                    static_cast<unsigned long long>(live.position_us), live.paused,
-                                    live.expired, audio.selected_pid,
-                                    audio.count ? audio.tracks[0].pid : 0u,
-                                    subtitle_state.tracks.empty() ? 0u
-                                                                  : subtitle_state.tracks[0].id);
-                        }
-                    }
-                    const int handled = osd.input(action, ptv::platform::monotonic_us());
-                    if (const auto position = osd.take_media_seek())
-                        (void)iptv_player_seek_media(*position);
-                    if (const auto speed = osd.take_media_speed())
-                        (void)iptv_player_set_speed(*speed);
-                    if (const auto paused = osd.take_media_pause())
-                        (void)iptv_player_pause_media(*paused);
-                    if (const auto selected = osd.take_picture_selection())
-                        iptv_native_agc_set_picture_mode(*selected);
-                    if (const auto delay = osd.take_audio_delay())
-                        iptv_player_set_audio_delay(*delay);
-                    if (osd.copy_picture_settings(*input.settings))
-                        ptv::save_settings(tv::storage::config_dir(), *input.settings);
-                    if (const auto selected = osd.take_audio_selection())
-                        (void)iptv_player_select_audio(*selected);
-                    if (const auto selected = osd.take_subtitle_selection())
-                        (void)iptv::player_subtitles().select(*selected);
-                    if (TV_DEV_SCRIPTS != 0 && action >= 0)
-                        say("[TV] playback control action=%d handled=%d", action, handled);
-                    return handled;
-                },
-                &input_context);
             iptv_native_agc_set_osd(
                 [](void *context, void *surface, std::size_t bytes, std::uint32_t pitch,
                    std::uint32_t sh, std::uint32_t width, std::uint32_t height, std::uint32_t depth,
@@ -1510,18 +1556,19 @@ int main()
                 &controls);
         }
         else
-        {
             say("[TV] playback controls font could not be loaded");
-            iptv_player_set_controls(
-                [](void *context, int) -> int
-                { return static_cast<ptv::RemoteBrowseView *>(context)->selected.empty() ? 0 : 2; },
-                &phone);
-        }
         iptv_player_set_sleep_deadline(model.sleep_timer.deadline());
         if (script.active())
             iptv_input_schedule_start(); // "during" steps count from here
+        ptv::crash::phase(ptv::crash::Phase::playback);
         const PlaybackOutcome outcome =
             play_candidates(request, script.watch_ms(), nullptr, resume ? &*resume : nullptr);
+        (void)model.viewing_tick(false);
+        if (viewing_blocked)
+        {
+            const auto *reason = model.parental().viewing_reason(ptv::platform::unix_time());
+            menu_notice = reason ? ptv::tr(reason) : ptv::tr("Viewing is unavailable");
+        }
         iptv_remote_set_browse_handler(nullptr, nullptr);
         iptv_player_set_controls(nullptr, nullptr);
         iptv_native_agc_set_osd(nullptr, nullptr);
@@ -1604,14 +1651,15 @@ int main()
         const auto selected_quality = controls.quality_selection();
         if ((media.presented || outcome.result == 0) &&
             model.finish_vod(request, media.position_us, media.duration_us,
-                             outcome.result == 0 && phone.selected.empty() && !selected_quality))
+                             outcome.result == 0 && !viewing_blocked && phone.selected.empty() &&
+                                 !selected_quality))
         {
             ptv::PlayRequest next;
             if (model.take_play_request(&next))
                 next_channel = std::move(next);
         }
-        if (selected_quality && outcome.result >= 0 && phone.selected.empty() &&
-            !model.sleep_timer.sleeping())
+        if (selected_quality && !viewing_blocked && model.playback_allowed() &&
+            outcome.result >= 0 && phone.selected.empty() && !model.sleep_timer.sleeping())
         {
             next_channel = request;
             next_channel->start_position_us = request.live ? 0 : media.position_us;

@@ -7,6 +7,7 @@
 // renderer is in use, so it runs unchanged in tests and on a PC.
 
 #pragma once
+#include "tv/share_bundle.hpp"
 
 #include "iptv_catalog.h"
 #include "iptv_http.h"
@@ -18,6 +19,7 @@
 #include "tv/library.hpp"
 #include "tv/guide.hpp"
 #include "tv/recording.hpp"
+#include "tv/source_check.hpp"
 #include "tv/portal.hpp"
 #include "tv/vod.hpp"
 #include "tv/parental.hpp"
@@ -25,6 +27,7 @@
 
 #include <array>
 #include <atomic>
+#include <mutex>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -166,6 +169,7 @@ class Model
     void close();
     // A backup/restore ends this model's lifetime. Recreate it before browsing again.
     bool close_for_storage();
+    bool export_shared_library(SharedLibrary &out);
     // Once per frame: keyboard answers, the steps of the account form, and
     // the result of a download.
     void poll();
@@ -191,6 +195,15 @@ class Model
         return pin_step_ != PinStep::none;
     }
     bool require_parent();
+    bool playback_allowed() const;
+    bool viewing_tick(bool active);
+    // Installed even without OSD fonts; 2 asks the native player to stop.
+    int viewing_control()
+    {
+        return viewing_tick(true) ? 0 : 2;
+    }
+    bool set_viewing_limits(unsigned minutes, int bedtime, unsigned wake);
+
     bool content_allowed(const iptv::ChannelView &channel) const;
     bool vod_allowed(unsigned index) const;
     int category_rule(std::string_view category, bool inherited = true) const;
@@ -460,6 +473,15 @@ class Model
     bool schedule_programme(unsigned index, const Programme &programme, bool record);
     void poll_programme_jobs();
     void toggle_recording(std::string_view channel);
+    void toggle_source_check();
+    void cancel_source_check(const char *reason = "Check stopped");
+    void block_source_check(bool blocked);
+    bool checking_source() const
+    {
+        return check_active_;
+    }
+    std::string source_check_status() const;
+
     void cancel_programme_job(std::int64_t id);
     std::vector<ProgrammeJob> programme_jobs() const
     {
@@ -507,6 +529,8 @@ class Model
     bool take_play_request(PlayRequest *request);
     // The focused live channel without changing history or playback health.
     std::optional<PlayRequest> preview_request(std::string_view channel_id) const;
+    // Source health checks decode without showing video and do not spend viewing time.
+    std::optional<PlayRequest> probe_request(std::string_view channel_id) const;
     // Called when the menu reopens after a channel that would not play.
     void report_watch(std::string_view channel_id);
     void report_playback_failure(const char *channel_id, const char *channel_name, int result,
@@ -600,6 +624,18 @@ class Model
     bool check_sleep_timer();
 
   private:
+    void poll_source_check();
+    void load_source_checks();
+    std::uint64_t source_check_identity() const;
+    SourceCheck source_check_;
+    CheckStore check_store_;
+    bool check_active_ = false, check_blocked_ = false;
+    std::uint64_t check_source_ = 0, check_fingerprint_ = 0, check_next_ = 0;
+    std::size_t check_cursor_ = 0, check_total_ = 0, check_passed_ = 0, check_failed_ = 0,
+                check_skipped_ = 0;
+    std::string check_channel_, check_message_;
+    std::vector<unsigned> check_order_;
+
     enum class PinStep
     {
         none,
@@ -611,6 +647,7 @@ class Model
     void clear_pin();
     void parental_changed();
     static void on_pin(const char *text, void *self);
+    mutable std::mutex viewing_mutex_;
     Parental parental_;
     PinStep pin_step_ = PinStep::none;
     bool pin_pending_ = false;

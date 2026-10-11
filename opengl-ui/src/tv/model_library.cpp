@@ -15,6 +15,28 @@
 
 namespace ptv
 {
+bool Model::export_shared_library(SharedLibrary &out)
+{
+    out = {};
+    if (!require_parent() || !library_.ready())
+        return false;
+    for (const auto &source : library_.sources())
+    {
+        if (source.kind == 1 && usb_playlist_path(source.url))
+            ++out.skipped_local;
+        else if (portable_source(source))
+            out.sources.push_back({source, library_.guide_url(source.id),
+                                   library_.guide_mapping(source.id)});
+    }
+    out.favorites = user_.favorite_ids;
+    for (const auto &folder : library_.folders())
+    {
+        const auto ids = library_.folder_channels(folder);
+        out.folders[folder] = {ids.begin(), ids.end()};
+    }
+    std::string checked;
+    return encode_shared_library(out, checked);
+}
 void Model::load_library()
 {
     selected_source_id_ = static_cast<int>(active_source_) + 1;
@@ -67,6 +89,7 @@ const SavedSource *Model::saved_source(std::int64_t id) const
 
 void Model::select_source_record(const SavedSource &source)
 {
+    cancel_source_check("Check stopped for source change");
     clear_home_playback();
     end_search();
     const bool changed = selected_source_id_ != source.id;
@@ -516,6 +539,8 @@ bool Model::play_vod(unsigned index)
 }
 bool Model::queue_vod(const iptv::ChannelView &item, const std::string &series, bool inherit_series)
 {
+    if (!playback_allowed())
+        return false;
     if (inherit_series)
         clear_home_playback();
     auto snapshot = item.Copy();

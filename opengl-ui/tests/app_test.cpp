@@ -230,6 +230,7 @@ TEST_F(AppTest, TranslatedMenusUseBakedGlyphsAndPreserveProviderNames)
     };
     const Entry entries[] = {
 #include "tv/translations.inc"
+#include "tv/translations_share.inc"
     };
     use_playlist("#EXTM3U\n#EXTINF:-1 group-title=\"News\",Settings\n"
                  "https://streams.example.invalid/one.m3u8\n");
@@ -830,6 +831,28 @@ TEST_F(AppTest, UsbRestoreRequiresConfirmationAndCanChooseAnotherDrive)
     EXPECT_EQ(app_->tab(), 5);
     EXPECT_EQ(app_->take_storage_request().action, ptv::StorageAction::none);
     EXPECT_FALSE(frame_.overlay.empty());
+}
+
+TEST_F(AppTest, SharingCanBeCancelledAndKeyboardStepsAreSequential)
+{
+    for (int i = 0; i < 4; ++i)
+        press(Action::page_next);
+    settings_row("Share with another console");
+    press(Action::confirm);
+    ASSERT_TRUE(app_->storage_open());
+    EXPECT_FALSE(app_->accepts_remote_search());
+    press(Action::confirm); // Prepare sender preview without opening a connection.
+    press(Action::confirm); // Address keyboard.
+    EXPECT_EQ(host::keyboard_title(), "Receiving console's IPv4 address");
+    host::set_keyboard_text("127.0.0.1");
+    idle();
+    EXPECT_EQ(host::keyboard_title(), "Receiver's full SHA-256 fingerprint");
+    host::set_keyboard_text("123456");
+    idle();
+    EXPECT_EQ(app_->take_storage_request().action, ptv::StorageAction::none);
+    press(Action::back);
+    EXPECT_FALSE(app_->storage_open());
+    EXPECT_FALSE(app_->storage_busy());
 }
 
 TEST_F(AppTest, SleepTimerSurvivesMenuReopenExpiresOnceAndKeepsPreviewAsleep)
@@ -1770,6 +1793,25 @@ TEST_F(AppTest, RandomInputNeverBreaksIt)
         ASSERT_LT(app_->tab(), 7);
         ASSERT_FALSE(frame_.scene.empty());
     }
+}
+
+TEST_F(AppTest, SourceCheckRowStartsAndCancelsWithoutChangingSource)
+{
+    const auto source = model_->selected_source_id();
+    press(Action::page_next);
+    press(Action::page_next);
+    press(Action::page_next);
+    ASSERT_EQ(app_->tab(), 4);
+    for (std::size_t i = 0; i < model_->saved_sources().size(); ++i)
+        move(Direction::down);
+    host::set_preview_probe(static_cast<int>(ptv::ProbeOutcome::unknown), 0, 1000);
+    press(Action::confirm);
+    EXPECT_TRUE(model_->checking_source());
+    EXPECT_EQ(model_->selected_source_id(), source);
+    press(Action::confirm);
+    EXPECT_FALSE(model_->checking_source());
+    EXPECT_EQ(host::keyboard_requests(), 0);
+    host::set_preview(false);
 }
 
 } // namespace
