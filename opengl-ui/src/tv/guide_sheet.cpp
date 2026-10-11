@@ -65,7 +65,7 @@ void GuideSheet::handle(const InputFrame &input, ui::Feedback &feedback)
     if (actions_ || jobs_)
     {
         const auto jobs = model.programme_jobs();
-        const unsigned count = jobs_ ? static_cast<unsigned>(jobs.size()) : 4u;
+        const unsigned count = jobs_ ? static_cast<unsigned>(jobs.size()) : 5u;
         if (input.is_pressed(Action::back) || input.is_pressed(Action::menu))
         {
             actions_ = jobs_ = false;
@@ -88,6 +88,11 @@ void GuideSheet::handle(const InputFrame &input, ui::Feedback &feedback)
                 actions_ = false;
                 jobs_ = true;
                 action_row_ = 0;
+            }
+            else if (action_row_ == 4 && row_ < model.visible_count())
+            {
+                model.edit_guide_mapping(model.visible(row_));
+                actions_ = false;
             }
             else if (action_row_ == 3)
             {
@@ -244,7 +249,7 @@ void GuideSheet::draw(ui::Canvas &canvas) const
         const std::string status = programme_time(p->start) + " - " + programme_time(p->end) +
                                    (available                         ? tr("   Catch-up available")
                                     : p->start <= now && now < p->end ? tr("   On now")
-                                    : p->start > now ? tr("   Upcoming")
+                                    : p->start > now                  ? tr("   Upcoming")
                                                      : tr("   Archive unavailable"));
         ui::text(list, fonts.regular, status, kMargin, 890, 22,
                  available ? tone::accent : theme.text_muted);
@@ -261,8 +266,9 @@ void GuideSheet::draw(ui::Canvas &canvas) const
         tr("Cross: Watch   D-pad: Channel / programme   L1/R1: Day   L2/R2: Page   Square: Now   "
            "Triangle: Search   Circle: Back"),
         kMargin, 990, 21, theme.text_muted);
-    ui::text(list, fonts.regular, "Options: Record / Remind / Scheduled programmes / Update guide",
-             kMargin, 1030, 21, theme.text_muted);
+    ui::text(list, fonts.regular,
+             "Options: Record / Remind / Scheduled programmes / Update / Match XMLTV", kMargin,
+             1030, 21, theme.text_muted);
     if (actions_ || jobs_)
     {
         list.rounded_rect({420, 230, 1140, 650}, 16, tone::night);
@@ -270,8 +276,8 @@ void GuideSheet::draw(ui::Canvas &canvas) const
                  290, 32, theme.text);
         const auto jobs = model.programme_jobs();
         const char *actions[] = {"Record to USB / cancel recording", "Set / cancel reminder",
-                                 "Scheduled programmes", "Update guide"};
-        const unsigned count = jobs_ ? static_cast<unsigned>(jobs.size()) : 4;
+                                 "Scheduled programmes", "Update guide", "Match XMLTV channel"};
+        const unsigned count = jobs_ ? static_cast<unsigned>(jobs.size()) : 5;
         const unsigned top = action_row_ / 6 * 6;
         for (unsigned i = top; i < count && i < top + 6; ++i)
         {
@@ -288,7 +294,7 @@ void GuideSheet::draw(ui::Canvas &canvas) const
                         state[std::clamp(job.state, 0, 4)] + "]";
             }
             else
-                label = actions[i];
+                label = tr(actions[i]);
             const auto &face = face_for(fonts, fonts.regular, label);
             ui::text(list, face, face.font->fit(label, 24, 1040), 465, y, 24, theme.text);
         }

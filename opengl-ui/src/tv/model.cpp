@@ -4,6 +4,7 @@
 
 #include "tv/i18n.hpp"
 #include "tv/model.hpp"
+#include "tv/usb_playlist.hpp"
 #include "tv/category_path.hpp"
 
 #include "iptv_ime.h"
@@ -304,6 +305,7 @@ bool Model::open()
     refresh_done_.store(false, std::memory_order_relaxed);
     stop_requested_.store(false, std::memory_order_relaxed);
     pending_account_ = iptv::XtreamStatus::ok;
+    pending_account_info_ = {};
     pending_account_message_.clear();
     play_requested_ = false;
     play_request_ = {};
@@ -382,6 +384,8 @@ bool Model::open()
 
 void Model::close()
 {
+    cancel_home_play();
+    home_series_.stop();
     clear_pin();
     end_search();
     vod_.stop();
@@ -436,17 +440,20 @@ void Model::poll()
     poll_pin();
     continue_account_form();
     consume_refresh();
-    if ((vod_.requested() || search_pending()) && !refreshing())
+    if ((home_waiting_ || vod_.requested() || search_pending()) && !refreshing())
         stop_guide();
-    vod_.poll(!refreshing() && !guide_thread_ && !search_busy());
-    search_movies_.poll(searching_ && !refreshing() && !guide_thread_ && !vod_.busy() &&
-                        !vod_.requested() && !search_shows_.busy());
-    search_shows_.poll(searching_ && !refreshing() && !guide_thread_ && !vod_.busy() &&
-                       !vod_.requested() && !search_movies_.busy() && !search_movies_.requested());
-    if (!vod_.busy() && !vod_.requested() && !search_busy() && !search_pending())
+    poll_home_playback();
+    vod_.poll(!home_waiting_ && !refreshing() && !guide_thread_ && !search_busy());
+    search_movies_.poll(!home_waiting_ && searching_ && !refreshing() && !guide_thread_ &&
+                        !vod_.busy() && !vod_.requested() && !search_shows_.busy());
+    search_shows_.poll(!home_waiting_ && searching_ && !refreshing() && !guide_thread_ &&
+                       !vod_.busy() && !vod_.requested() && !search_movies_.busy() &&
+                       !search_movies_.requested());
+    if (!home_waiting_ && !vod_.busy() && !vod_.requested() && !search_busy() && !search_pending())
         poll_guide();
     const auto now = platform::unix_time();
-    if (catalog_loaded_ && !refreshing() && !vod_.busy() && !searching_ && now >= next_schedule_check_)
+    if (catalog_loaded_ && !home_waiting_ && !refreshing() && !vod_.busy() && !searching_ &&
+        now >= next_schedule_check_)
     {
         // A failed scheduled refresh retries in an hour, not on every frame.
         next_schedule_check_ = now + 3600;
@@ -482,7 +489,7 @@ void Model::load_cache()
                                                                      : SourceHealth::empty;
     index_.build(catalog_);
     if (catalog_loaded_)
-        (void)guide_.load(guide_path(), catalog_.source_id);
+        (void)guide_.load(guide_path(), guide_source_id());
     adopt_catalog();
 }
 
@@ -496,6 +503,8 @@ void Model::adopt_catalog()
     if (!channel_names_.empty())
         index_.build(catalog_, channel_names_);
     vod_.playlist_updated();
+    search_movies_.playlist_updated();
+    search_shows_.playlist_updated();
     if (!catalog_.empty())
         (void)library_.observe_channels(selected_source_id_, catalog_, platform::unix_time());
     channel_history_ = library_.channel_history(selected_source_id_, catalog_);
@@ -921,6 +930,7 @@ std::optional<PlayRequest> Model::preview_request(std::string_view channel_id) c
             request.urls.emplace_back(url);
     request.user_agent = channel.http_user_agent;
     request.referrer = channel.http_referrer;
+    apply_source_http(request);
     if (active_source_ == iptv::SourceKind::Tvheadend)
     {
         request.authorization = local_tv_authorization(local_source_);
@@ -963,6 +973,7 @@ bool Model::play(unsigned catalog_index)
         catalog_[catalog_index].media_kind != iptv::MediaKind::live ||
         !content_allowed(catalog_[catalog_index]))
         return false;
+    clear_home_playback();
     const iptv::ChannelView channel = this->channel(catalog_index);
     sleep_timer.wake();
     play_request_ = {};
@@ -975,6 +986,7 @@ bool Model::play(unsigned catalog_index)
             play_request_.urls.emplace_back(alternate);
     play_request_.user_agent = channel.http_user_agent;
     play_request_.referrer = channel.http_referrer;
+    apply_source_http(play_request_);
     if (active_source_ == iptv::SourceKind::Tvheadend)
     {
         play_request_.authorization = local_tv_authorization(local_source_);
@@ -1188,7 +1200,7 @@ void Model::apply_custom_url(const char *url)
                tr("An update was still running."));
         return;
     }
-    if (!iptv::http::IsSupportedPlaylistUrl(url))
+    if (!usb_playlist_path(url) && !iptv::http::IsSupportedPlaylistUrl(url))
     {
         notify(Level::error, tr("That address cannot be used"),
                tr("It must start with http:// or https:// and have no spaces."));
@@ -1243,6 +1255,21 @@ void Model::continue_account_form()
     case AccountStep::local_password:
         iptv_ime_request_password(tr("Tvheadend password"), tr("Password"),
                                   IPTV_IME_BUFFER_CHARACTERS, &Model::on_local_password, this);
+        break;
+    case AccountStep::http_user_agent:
+        iptv_ime_request_prompt(http_form_.user_agent.c_str(), tr("Source user agent (1 of 3)"),
+                                tr("Leave empty for the default"), IPTV_IME_BUFFER_CHARACTERS,
+                                &Model::on_http_user_agent, this);
+        break;
+    case AccountStep::http_extra:
+        iptv_ime_request_prompt("", tr("Custom HTTP header"),
+                                tr("Name: value; empty to save; - to clear all"),
+                                IPTV_IME_BUFFER_CHARACTERS, &Model::on_http_extra, this);
+        break;
+    case AccountStep::http_referrer:
+        iptv_ime_request_prompt(http_form_.referrer.c_str(), tr("Source referrer (2 of 3)"),
+                                "https://provider.example/", IPTV_IME_BUFFER_CHARACTERS,
+                                &Model::on_http_referrer, this);
         break;
     case AccountStep::none:
         break;
@@ -1319,6 +1346,7 @@ void Model::apply_account_password(const char *password)
 
 void Model::refresh()
 {
+    cancel_home_play();
     end_search();
     vod_.stop();
     stop_guide();
@@ -1343,6 +1371,9 @@ void Model::refresh()
     const bool custom = active_source_ == iptv::SourceKind::Custom;
     const bool account = active_source_ == iptv::SourceKind::Xtream;
     refresh_source_ = active_source_;
+    refresh_saved_source_id_ = selected_source_id_;
+    refresh_http_ =
+        saved_source(selected_source_id_) ? *saved_source(selected_source_id_) : SavedSource{};
     refresh_url_ = custom ? custom_url_ : account ? std::string() : std::string(kCatalogUrl);
     refresh_cache_path_ = cache_path(active_source_);
     refresh_source_id_ = source_id(active_source_);
@@ -1357,6 +1388,7 @@ void Model::refresh()
     refresh_count_.store(0, std::memory_order_relaxed);
     pending_saved_ = false;
     pending_account_ = iptv::XtreamStatus::ok;
+    pending_account_info_ = {};
     pending_account_message_.clear();
     set_status(tr("Updating"), Level::busy);
     set_source_text(std::string(tr("Downloading ")) + source_name(active_source_),
@@ -1408,10 +1440,16 @@ void Model::run_refresh()
     pending_report_ = {};
     pending_saved_ = false;
     pending_account_ = iptv::XtreamStatus::ok;
+    pending_account_info_ = {};
     pending_account_stage_.clear();
     pending_account_message_.clear();
-    pending_network_ = platform::network_init();
+    const bool usb = refresh_source_ == iptv::SourceKind::Custom && usb_playlist_path(refresh_url_);
+    pending_network_ = usb ? iptv::http::Status::ok : platform::network_init();
 
+    iptv::http::RequestHeaders headers{refresh_http_.user_agent.c_str(),
+                                       refresh_http_.referrer.c_str()};
+    headers.extra_headers = refresh_http_.extra_headers.c_str();
+    headers.credential_origin = refresh_http_.url.c_str();
     const auto stopping = [this]() { return stop_requested_.load(std::memory_order_acquire); };
     if (pending_network_ == iptv::http::Status::ok && !stopping())
     {
@@ -1454,7 +1492,7 @@ void Model::run_refresh()
                     return false;
                 }
                 pending_fetch_ = platform::fetch(endpoint.c_str(), response.data(), response.size(),
-                                                 response.max_bytes, &control);
+                                                 response.max_bytes, &control, &headers);
                 return pending_fetch_.status == iptv::http::Status::ok && !stopping();
             };
             pending_account_stage_ = "authentication";
@@ -1462,6 +1500,11 @@ void Model::run_refresh()
             {
                 pending_account_ = iptv::ParseXtreamAuth(
                     std::string_view(response.data(), pending_fetch_.bytes), &auth);
+                if (auth.authenticated &&
+                    (pending_account_ == iptv::XtreamStatus::ok ||
+                     pending_account_ == iptv::XtreamStatus::account_inactive))
+                    pending_account_info_ = {auth.expires_unix, auth.max_connections,
+                                             static_cast<std::int64_t>(platform::unix_time())};
                 if (pending_account_ != iptv::XtreamStatus::ok)
                     pending_account_message_ = auth.message;
             }
@@ -1508,8 +1551,8 @@ void Model::run_refresh()
                             return read && !to->parser->full();
                         },
                         &receiver};
-                    pending_fetch_ = platform::fetch_list(endpoint.c_str(), sink,
-                                                          iptv::kMaxXtreamResponseBytes, &control);
+                    pending_fetch_ = platform::fetch_list(
+                        endpoint.c_str(), sink, iptv::kMaxXtreamResponseBytes, &control, &headers);
                     // Stopped by the parser: what it says is the answer.
                     if (pending_fetch_.status == iptv::http::Status::stopped)
                         pending_fetch_.status = iptv::http::Status::ok;
@@ -1544,8 +1587,10 @@ void Model::run_refresh()
                            (channels != 0 || to->bytes < kPlaylistProbeBytes);
                 },
                 &receiver};
-            pending_fetch_ = platform::fetch_list(refresh_url_.c_str(), sink,
-                                                  iptv::http::kMaxListBytes, &control);
+            pending_fetch_ =
+                usb ? read_usb_playlist(refresh_url_, sink, &control, usb_root_)
+                    : platform::fetch_list(refresh_url_.c_str(), sink, iptv::http::kMaxListBytes,
+                                           &control, &headers);
             if (pending_fetch_.status == iptv::http::Status::stopped)
                 pending_fetch_.status = pending_report_.input_too_large
                                             ? iptv::http::Status::response_too_large
@@ -1562,7 +1607,7 @@ void Model::run_refresh()
             pending_index_.build(pending_catalog_);
         }
     }
-    if (pending_network_ == iptv::http::Status::ok)
+    if (!usb && pending_network_ == iptv::http::Status::ok)
         platform::network_shutdown();
     refresh_done_.store(true, std::memory_order_release);
 }
@@ -1631,6 +1676,24 @@ void Model::consume_refresh()
     const bool account = refresh_source_ == iptv::SourceKind::Xtream;
     if (account)
         save_account_receipt();
+    const auto *refreshed = saved_source(refresh_saved_source_id_);
+    const bool account_info_ready = account && pending_account_info_.checked_unix && refreshed &&
+                                    refreshed->kind == 2 &&
+                                    refreshed->url == refresh_account_.server_url &&
+                                    refreshed->username == refresh_account_.username &&
+                                    refreshed->password == refresh_account_.password;
+    if (account_info_ready)
+    {
+        const bool saved =
+            library_.save_account_info(refresh_saved_source_id_, pending_account_info_);
+        if (saved)
+            sources_ = library_.sources();
+        else
+            for (auto &source : sources_)
+                if (source.id == refresh_saved_source_id_)
+                    source.account = pending_account_info_;
+        ++revision_;
+    }
     const bool success = pending_network_ == iptv::http::Status::ok &&
                          pending_fetch_.status == iptv::http::Status::ok &&
                          (!account || pending_account_ == iptv::XtreamStatus::ok) &&
@@ -1701,6 +1764,8 @@ void Model::consume_refresh()
             catalog_error_ = problem;
         }
     }
+    if (account_info_ready)
+        warn_account_expiry();
     pending_catalog_ = {};
     pending_index_.clear();
     refresh_count_.store(0, std::memory_order_relaxed);
@@ -1712,7 +1777,7 @@ void Model::consume_refresh()
 }
 
 std::vector<Model::SearchResult> Model::search_results(std::string_view query,
-                                                     bool *truncated) const
+                                                       bool *truncated) const
 {
     std::vector<SearchResult> rows;
     if (truncated)

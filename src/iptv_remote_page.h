@@ -47,6 +47,15 @@ input[type=range]{padding:0;min-height:44px;accent-color:#ff9445;cursor:pointer}
 <div class="row"><button class="primary" type="submit">Search on TV</button><button id="clear" type="button">Clear</button></div>
 <div class="row"><button type="button" data-key="search">Search &amp; filters on TV</button></div>
 <p class="muted">Up to 39 characters. Search the current channel list; Back also stops playback.</p></form>
+<section class="card" aria-label="Channel browser">
+<button id="browse-open" type="button" style="width:100%">Channels and guide</button>
+<div id="browse-panel" hidden>
+<form id="browse-search"><p><label for="browse-query">FIND ON THIS PHONE</label><input id="browse-query" type="search" maxlength="78" autocomplete="off" placeholder="Channel or programme on now"></p><button type="submit">Find channels</button></form>
+<p class="muted" id="browse-label">Current source, with the TV's parental and hidden-channel rules.</p>
+<div id="browse-results" style="max-height:65vh;overflow:auto" aria-live="polite"></div>
+<div class="row"><button id="browse-prev" type="button">Previous page</button><button id="browse-next" type="button">Next page</button></div>
+<p class="muted">Browse while watching. Tap a channel name to switch the TV.</p>
+</div></section>
 <section class="card"><button id="manage-sources" type="button" style="width:100%" aria-expanded="false" aria-controls="source-editor">Manage sources</button>
 <div id="source-editor" hidden>
 <p class="muted">Save playlists and accounts with this keyboard. Return to the TV menu before editing.</p>
@@ -58,6 +67,13 @@ input[type=range]{padding:0;min-height:44px;accent-color:#ff9445;cursor:pointer}
 <div id="source-account"><p><label for="source-user">USER NAME</label><input id="source-user" maxlength="255" autocapitalize="none" autocomplete="off"></p>
 <p><label for="source-password">PASSWORD</label><input id="source-password" type="password" maxlength="255" autocomplete="new-password"><span class="muted" id="source-password-hint">Enter the account password.</span></p></div>
 <p id="source-portal"><label for="source-mac">MAC CODE</label><input id="source-mac" maxlength="17" placeholder="00:1A:79:12:34:56" autocomplete="off"></p>
+<p><label for="source-agent">USER AGENT (OPTIONAL)</label><input id="source-agent" maxlength="512" autocomplete="off" placeholder="Default when empty"></p>
+<p><label for="source-referrer">REFERRER (OPTIONAL)</label><input id="source-referrer" type="url" maxlength="2048" autocomplete="off" placeholder="https://provider.example/"></p>
+<p><label for="source-headers">CUSTOM HEADERS (OPTIONAL)</label><textarea id="source-headers" maxlength="4096" rows="4" autocomplete="off" placeholder="X-Token: value"></textarea></p>
+<p><label><input id="source-headers-clear" type="checkbox"> Clear saved custom headers</label></p>
+<p id="source-headers-state" class="muted"></p>
+<p class="muted">One Name: value per line, up to 16. Blank keeps saved values. Custom headers stay on the source origin; built-in fields take priority.</p>
+<p class="muted">Used for this source's downloads and playback. A channel's own user agent or referrer takes priority.</p>
 <p><label for="source-schedule">REFRESH</label><select id="source-schedule"><option value="0">Daily</option><option value="1">Weekly</option><option value="2">Only when asked</option></select></p>
 <div class="row"><button id="source-save" class="primary" type="submit">Save on TV</button><button id="source-select" type="button">Use on TV</button></div>
 <div class="row"><button id="source-remove" type="button">Remove source</button></div>
@@ -67,7 +83,7 @@ input[type=range]{padding:0;min-height:44px;accent-color:#ff9445;cursor:pointer}
 <script>
 const $=id=>document.getElementById(id);
 let paired=false,busy=false,volumeEditing=false,volumePending=null,volumeSending=false;
-function unpair(){paired=false;volumePending=null;sourceRows=[];$('source-form').reset();$('source-list').replaceChildren();$('remote').disabled=true;$('remote').hidden=true;$('pair').hidden=false}
+function unpair(){clearBrowse();paired=false;volumePending=null;sourceRows=[];$('source-form').reset();$('source-list').replaceChildren();$('remote').disabled=true;$('remote').hidden=true;$('pair').hidden=false}
 async function request(path,body){
  const response=await fetch('/api/'+path,{method:body===undefined?'GET':'POST',headers:{'X-ProsperoTV-Remote':'1','Content-Type':'text/plain;charset=UTF-8'},credentials:'same-origin',body,signal:AbortSignal.timeout(4000)});
  const text=await response.text();
@@ -78,6 +94,40 @@ async function connect(){
  catch(error){$('status').textContent=error.message||'Cannot connect. Check the TV and Wi-Fi.'}
 }
 $('pair').onsubmit=async event=>{event.preventDefault();try{await request('pair',$('pin').value);$('pin').value='';await connect()}catch(error){$('status').textContent=error.message}};
+let browseSource='',browseMode='list',browseChannel='',browseOffset=0,browseNext=null,browsePrevious=[],browseGeneration=0;
+function clearBrowse(){browseSource='';browsePrevious=[];$('browse-results').replaceChildren()}
+function browseButton(label,action){const button=document.createElement('button');button.type='button';button.textContent=label;button.onclick=action;return button}
+async function browsePlay(id){
+ try{await request('browse',JSON.stringify({operation:'play',source:browseSource,channel:id}));$('status').textContent='Opening channel on TV'}
+ catch(error){clearBrowse();$('status').textContent=error.message}
+}
+async function loadBrowse(reset=false){
+ if(!paired)return;if(reset){browseMode='list';browseChannel='';browseOffset=0;browsePrevious=[];browseSource=''}
+ const query=$('browse-query').value;if([...query].length>39){$('status').textContent='Use up to 39 characters.';return}
+ const generation=++browseGeneration;
+ try{
+  const data=JSON.parse(await request('browse',JSON.stringify({operation:browseMode,source:browseSource,channel:browseChannel,offset:browseOffset,query})));
+  if(generation!==browseGeneration)return;
+  browseSource=data.source;browseNext=data.next;$('browse-results').replaceChildren();
+  $('browse-label').textContent=browseMode==='guide'?data.name+' - programme guide':'Current source - tap a channel to watch';
+  if(browseMode==='guide')$('browse-results').append(browseButton('Watch '+data.name,()=>browsePlay(browseChannel)),browseButton('Back to channels',()=>loadBrowse(true)));
+  for(const item of data.channels||data.programmes||[]){
+   const row=document.createElement('div');row.className='card';row.style.padding='12px';
+   if(browseMode==='list'){
+    const play=browseButton(item.name,()=>browsePlay(item.id));play.style.width='100%';row.append(play);
+    const text=document.createElement('p');text.className='muted';text.textContent=[item.group,item.now?'Now: '+item.now:'',item.next?'Next: '+item.next:''].filter(Boolean).join(' | ');row.append(text);
+    row.append(browseButton('Guide',()=>{browseMode='guide';browseChannel=item.id;browseOffset=0;browsePrevious=[];loadBrowse()}));
+   }else{const title=document.createElement('strong');title.textContent=item.title;const time=document.createElement('p');time.className='muted';time.textContent=new Date(item.start*1000).toLocaleString()+' - '+new Date(item.end*1000).toLocaleTimeString();row.append(title,time)}
+   $('browse-results').append(row);
+  }
+  if(!(data.channels||data.programmes||[]).length){const empty=document.createElement('p');empty.className='muted';empty.textContent=browseMode==='guide'?'No upcoming programmes in the saved guide.':'No matching channels.';$('browse-results').append(empty)}
+  $('browse-prev').disabled=!browsePrevious.length;$('browse-next').disabled=browseNext===null;
+ }catch(error){if(generation!==browseGeneration)return;clearBrowse();$('status').textContent=error.message;$('browse-label').textContent=error.message}
+}
+$('browse-open').onclick=()=>{$('browse-panel').hidden=!$('browse-panel').hidden;if(!$('browse-panel').hidden)loadBrowse(true)};
+$('browse-search').onsubmit=event=>{event.preventDefault();loadBrowse(true)};
+$('browse-next').onclick=()=>{if(browseNext===null)return;browsePrevious.push(browseOffset);browseOffset=browseNext;loadBrowse()};
+$('browse-prev').onclick=()=>{if(!browsePrevious.length)return;browseOffset=browsePrevious.pop();loadBrowse()};
 async function command(path,body){
  if(busy||!paired)return;busy=true;
  try{$('status').textContent=await request(path,body)}catch(error){$('status').textContent=error.message||'Connection lost. Check the TV and Wi-Fi.'}finally{busy=false}
@@ -96,7 +146,8 @@ function sourceFields(){
 function editSource(){
  const source=sourceRows.find(s=>String(s.id)===$('source-list').value);
  $('source-kind').value=source&&source.kind?source.kind:1;$('source-kind').disabled=!!source;
- for(const [id,key] of [['name','name'],['url','url'],['user','username'],['mac','mac'],['schedule','schedule']])$('source-'+id).value=source?source[key]:(id==='schedule'?'0':'');
+ $('source-headers').value='';$('source-headers-clear').checked=false;$('source-headers-state').textContent=source&&source.extraHeadersSet?'Custom headers saved (values hidden).':'';
+ for(const [id,key] of [['name','name'],['url','url'],['user','username'],['mac','mac'],['schedule','schedule'],['agent','userAgent'],['referrer','referrer']])$('source-'+id).value=source?source[key]:(id==='schedule'?'0':'');
  $('source-password').value='';$('source-password-hint').textContent=source&&source.passwordSet?'Leave blank to keep the saved password.':'Enter the account password.';
  $('source-save').disabled=!!source&&source.kind===0;$('source-select').disabled=!source||!source.url;$('source-remove').disabled=!source||source.id<=4;sourceFields();
 }
@@ -116,7 +167,8 @@ async function sourceAction(details){
  catch(error){$('status').textContent=error.message||'Could not save. Check the TV and Wi-Fi.'}finally{busy=false}
 }
 $('source-form').onsubmit=event=>{
- event.preventDefault();const details={operation:'save',id:Number($('source-list').value),kind:Number($('source-kind').value),name:$('source-name').value,url:$('source-url').value,username:$('source-user').value,mac:$('source-mac').value,schedule:Number($('source-schedule').value)};
+ event.preventDefault();const details={operation:'save',id:Number($('source-list').value),kind:Number($('source-kind').value),name:$('source-name').value,url:$('source-url').value,username:$('source-user').value,mac:$('source-mac').value,schedule:Number($('source-schedule').value),userAgent:$('source-agent').value,referrer:$('source-referrer').value};
+ if($('source-headers-clear').checked)details.extraHeaders='';else if($('source-headers').value)details.extraHeaders=$('source-headers').value;
  if($('source-password').value)details.password=$('source-password').value;sourceAction(details);
 };
 $('source-select').onclick=()=>sourceAction({operation:'select',id:Number($('source-list').value)});

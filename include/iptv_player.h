@@ -5,6 +5,7 @@
 #ifndef IPTV_PLAYER_H
 #define IPTV_PLAYER_H
 #include "iptv_stream.h"
+#include "iptv_hls.h"
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -20,6 +21,11 @@ extern "C"
                                      const char *user_agent, const char *referrer,
                                      int reconnect_live);
     /* Live history is independent of reconnect policy; disable it for VOD/catch-up. */
+    int iptv_player_run_configured(const char *url, const char *channel_name,
+                                   const char *user_agent, const char *referrer,
+                                   const char *authorization, const char *credential_origin,
+                                   const char *extra_headers, unsigned stop_after_ms,
+                                   int reconnect_live, int live);
     int iptv_player_run_authenticated(const char *url, const char *channel_name,
                                       const char *user_agent, const char *referrer,
                                       const char *authorization, const char *credential_origin,
@@ -34,6 +40,15 @@ extern "C"
      * to consume it, or 2 to stop for a channel switch. */
     typedef int (*iptv_player_controls_t)(void *context, int action);
     void iptv_player_set_controls(iptv_player_controls_t controls, void *context);
+    typedef struct iptv_player_quality_state
+    {
+        iptv_hls_quality_t variants[IPTV_HLS_MAX_VARIANTS];
+        iptv_hls_quality_t preference;
+        uint32_t count, selected;
+    } iptv_player_quality_state_t;
+    void iptv_player_quality_state(iptv_player_quality_state_t *state);
+    /* Set between sessions; descriptor is revalidated against each fresh master. */
+    void iptv_player_set_quality(const iptv_hls_quality_t *quality);
     typedef struct iptv_player_audio_state
     {
         iptv_stream_audio_track_t tracks[IPTV_STREAM_MAX_AUDIO_TRACKS];
@@ -67,6 +82,7 @@ extern "C"
     } iptv_player_media_state_t;
     /* Start position is set between foreground sessions; snapshots persist after stop. */
     void iptv_player_set_start_position(uint64_t position_us);
+    void iptv_player_set_initial_controls(int paused, unsigned speed_percent, int delay_ms);
     void iptv_player_media_state(iptv_player_media_state_t *state);
     int iptv_player_seek_media(uint64_t position_us);
     int iptv_player_pause_media(int paused);

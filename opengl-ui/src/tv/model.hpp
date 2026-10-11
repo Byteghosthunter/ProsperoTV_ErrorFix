@@ -35,6 +35,25 @@
 namespace ptv
 {
 
+// Read-only playback view. The owner must detach the remote handler before
+// changing or destroying the borrowed catalogue and guide.
+struct RemoteBrowseView
+{
+    const iptv::Catalog *catalog = nullptr;
+    const Guide *guide = nullptr;
+    std::vector<unsigned> order;
+    std::vector<std::uint8_t> marks;
+    // Borrowed only for a synchronous menu request; playback owns its copies.
+    std::span<const unsigned> menu_order;
+    std::span<const std::uint8_t> menu_marks;
+    const std::map<std::string, std::string, std::less<>> *menu_names = nullptr;
+    bool parental_prompt = false;
+    std::map<std::string, std::string, std::less<>> names;
+    std::string source, current_channel, selected;
+    int handle(std::string_view input, std::string &output);
+    std::string selection_request() const;
+};
+
 // What the player is asked to open: the channel's addresses, best first.
 struct PlayRequest
 {
@@ -43,7 +62,7 @@ struct PlayRequest
     std::vector<std::string> urls;
     std::string user_agent;
     std::string referrer;
-    std::string authorization, credential_origin;
+    std::string authorization, credential_origin, extra_headers;
     std::uint64_t source_id = 0;
     bool reconnect_live = false;
     bool live = false;
@@ -118,6 +137,8 @@ struct ViewState
     int focused_source = 0;
     int vod_kind = -1, vod_focus = 0;
     bool vod_all = false;
+    std::string vod_genre, vod_year;
+    int vod_sort = 0;
     std::string vod_category, vod_series, vod_series_name, vod_series_cover, vod_query;
     std::string vod_series_group;
     bool vod_series_adult = false;
@@ -212,11 +233,23 @@ class Model
     const SavedSource *saved_source(std::int64_t id) const;
     void use_saved_source(std::int64_t id);
     void add_source(iptv::SourceKind kind);
+    bool import_usb_playlist(const std::string &path);
+    const std::string &usb_root() const
+    {
+        return usb_root_;
+    }
+    void set_usb_root(std::string root)
+    {
+        usb_root_ = std::move(root);
+    }
     void edit_saved_source(std::int64_t id);
+    void edit_source_http(std::int64_t id);
     bool remove_source(std::int64_t id);
     bool set_schedule(std::int64_t id, RefreshSchedule schedule);
     // Called on the menu thread by the authenticated phone remote.
     int remote_sources(std::string_view input, std::string &output);
+    int remote_browse(std::string_view input, std::string &output);
+    RemoteBrowseView remote_browse_view(bool snapshot = true) const;
     VodLibrary &vod()
     {
         return vod_;
@@ -259,6 +292,15 @@ class Model
         return search_busy() || search_pending();
     }
     bool search_vod_allowed(const iptv::ChannelView &item) const;
+    struct HomeItem
+    {
+        std::string id, title, detail, logo;
+        bool on_demand = false;
+        std::uint64_t position_us = 0, duration_us = 0;
+    };
+    std::array<std::vector<HomeItem>, 3> home_items() const;
+    bool play_home(std::string_view id, bool on_demand);
+    bool cancel_home_play();
     bool play_vod(unsigned index);
     bool save_vod_progress(std::string_view id, std::uint64_t position_us,
                            std::uint64_t duration_us);
@@ -325,12 +367,13 @@ class Model
     // European ones: the faces for them are large, and loaded only when asked for.
     bool uses_east_asian() const
     {
-        return index_.east_asian || vod_.east_asian() || search_movies_.east_asian() ||
-               search_shows_.east_asian();
+        return home_east_asian_ || home_series_.east_asian() || index_.east_asian ||
+               vod_.east_asian() || search_movies_.east_asian() || search_shows_.east_asian();
     }
     bool uses_korean() const
     {
-        return index_.korean || vod_.korean() || search_movies_.korean() || search_shows_.korean();
+        return home_korean_ || home_series_.korean() || index_.korean || vod_.korean() ||
+               search_movies_.korean() || search_shows_.korean();
     }
     // Changes whenever the visible list may have changed.
     unsigned revision() const
@@ -452,6 +495,15 @@ class Model
         return guide_status_;
     }
     void refresh_guide();
+    void edit_guide_url(std::int64_t source);
+    void edit_guide_mapping(unsigned channel);
+    bool set_guide_url(std::int64_t source, std::string_view url);
+    bool set_guide_mapping(std::string_view channel, std::string_view guide_id);
+    std::string guide_url_override(std::int64_t source) const
+    {
+        return library_.guide_url(source);
+    }
+    std::string guide_match(std::string_view channel) const;
     bool take_play_request(PlayRequest *request);
     // The focused live channel without changing history or playback health.
     std::optional<PlayRequest> preview_request(std::string_view channel_id) const;
@@ -576,6 +628,9 @@ class Model
         local_address,
         local_username,
         local_password,
+        http_user_agent,
+        http_referrer,
+        http_extra,
     };
 
     std::string path(const char *name) const;
@@ -589,6 +644,11 @@ class Model
     void set_status(std::string label, Level level);
     void set_source_text(std::string title, std::string detail);
     void notify(Level level, std::string title, std::string body = {});
+    void warn_account_expiry();
+    void apply_source_http(PlayRequest &request) const;
+    static void on_http_user_agent(const char *text, void *self);
+    static void on_http_referrer(const char *text, void *self);
+    static void on_http_extra(const char *text, void *self);
 
     void apply_custom_url(const char *url);
     void apply_account_server(const char *server);
@@ -613,6 +673,7 @@ class Model
     void mark_visibility();
     bool refresh_needed() const;
     std::string guide_path() const;
+    std::uint64_t guide_source_id() const;
     void stop_guide();
     void poll_guide();
     static void *guide_entry(void *self);
@@ -620,6 +681,9 @@ class Model
 
     static void on_query(const char *text, void *self);
     static void on_vod_query(const char *text, void *self);
+    void reload_guide_configuration();
+    static void on_guide_url(const char *text, void *self);
+    static void on_guide_mapping(const char *text, void *self);
     static void on_custom_url(const char *text, void *self);
     static void on_account_server(const char *text, void *self);
     static void on_account_username(const char *text, void *self);
@@ -650,7 +714,17 @@ class Model
     bool hide_failed_ = false;
     bool resume_attempted_ = false;
     Guide guide_, pending_guide_;
+    mutable bool home_east_asian_ = false, home_korean_ = false;
     VodLibrary vod_;
+    VodLibrary home_series_;
+    ResumeItem home_playback_;
+    std::int64_t home_source_ = 0;
+    std::uint64_t home_fingerprint_ = 0;
+    bool home_waiting_ = false;
+    std::uint64_t home_deadline_ = 0;
+    void clear_home_playback();
+    void poll_home_playback();
+    bool next_home_episode(const PlayRequest &request);
     VodLibrary search_movies_, search_shows_;
     bool searching_ = false;
     bool search_busy() const
@@ -661,7 +735,10 @@ class Model
     {
         return searching_ && (search_movies_.requested() || search_shows_.requested());
     }
-    bool queue_vod(const iptv::ChannelView &item, const std::string &series);
+    bool home_vod_allowed(const ResumeItem &item) const;
+    bool queue_home_vod(ResumeItem item);
+    bool queue_vod(const iptv::ChannelView &item, const std::string &series,
+                   bool inherit_series = true);
     void *guide_thread_ = nullptr;
     std::atomic<bool> guide_done_{false}, guide_stop_{false};
     std::vector<std::string> guide_urls_;
@@ -696,11 +773,16 @@ class Model
     // ---- sources ----
     iptv::SourceKind active_source_ = iptv::SourceKind::BuiltIn;
     std::array<SourceHealth, kSourceCount> health_{};
+    std::uint64_t guide_expected_source_ = 0;
+    std::int64_t guide_edit_source_ = 0;
+    std::string guide_edit_channel_;
+    std::map<std::string, std::string> guide_mapping_;
     std::string custom_url_;
+    std::string usb_root_ = "/mnt";
     iptv::XtreamCredentials xtream_;
     iptv::XtreamCredentials account_form_;
     PortalCredentials portal_, portal_form_, refresh_portal_;
-    SavedSource local_source_, local_form_, refresh_local_;
+    SavedSource local_source_, local_form_, refresh_local_, http_form_, refresh_http_, guide_http_;
     AccountStep account_step_ = AccountStep::none;
     bool account_prompt_pending_ = false;
 
@@ -722,6 +804,8 @@ class Model
     CatalogIndex pending_index_; // of pending_catalog_
     iptv::XtreamStatus pending_account_ = iptv::XtreamStatus::ok;
     std::string pending_account_stage_;
+    AccountInfo pending_account_info_{};
+    std::int64_t refresh_saved_source_id_ = 0;
     std::string pending_account_message_;
     bool pending_saved_ = false;
 

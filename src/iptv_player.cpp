@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later */
 
 #include "iptv_player.h"
+#include <algorithm>
 #if IPTV_PROBE || IPTV_NETWORK_COMPAT
 #include <curl/curl.h>
 #include <pwd.h>
@@ -12,7 +13,6 @@
 #include <sys/socket.h>
 #include <time.h>
 #include <atomic>
-#include <algorithm>
 #include <dlfcn.h>
 #include <setjmp.h>
 // The console has no POSIX account/home database. Curl must use only the
@@ -140,6 +140,8 @@ constexpr std::size_t kNetworkReadBytes = 256u * 1024u;
 constexpr std::size_t kReadAheadBytes = 16u * 1024u * 1024u;
 constexpr std::size_t kPlaylistBytes = IPTV_HLS_DEFAULT_MAX_INPUT_BYTES;
 constexpr std::uint64_t kVideoProgressTimeoutUsec = UINT64_C(15000000);
+std::mutex gQualityMutex;
+iptv_player_quality_state_t gQualityState{};
 std::mutex gLiveMutex;
 iptv_player_live_state_t gLiveState{};
 int gLivePauseRequest = -1;
@@ -149,6 +151,7 @@ iptv_player_media_state_t gMediaState{};
 std::atomic<std::int64_t> gMediaSeekRequest{-1};
 std::atomic<std::uint64_t> gMediaStartPosition{0};
 int gMediaPauseRequest = -1;
+bool gInitialPaused = false;
 bool gMediaSession = false;
 std::atomic<std::uint32_t> gMediaSavedAudio{UINT32_MAX}, gMediaSavedSubtitle{0};
 std::atomic<std::uint32_t> gMediaRestoreAudio{UINT32_MAX};
@@ -691,6 +694,7 @@ struct HlsVariantCandidates
     std::uint32_t count = 0;
     char urls[IPTV_HLS_MAX_VARIANTS][IPTV_HLS_URL_BYTES]{};
     std::string manifests[IPTV_HLS_MAX_VARIANTS];
+    std::uint32_t indices[IPTV_HLS_MAX_VARIANTS]{};
 };
 
 void BuildNativeCandidates(iptv_hls_playlist_t *master, const iptv_hls_limits_t *limits,
@@ -699,10 +703,27 @@ void BuildNativeCandidates(iptv_hls_playlist_t *master, const iptv_hls_limits_t 
     if (!master || !limits || !candidates)
         return;
 
+    candidates->count = 0;
+    iptv_hls_quality_t preference{};
+    unsigned quality_indices[IPTV_HLS_MAX_VARIANTS]{};
+    {
+        std::lock_guard lock(gQualityMutex);
+        preference = gQualityState.preference;
+        gQualityState.count = 0;
+        gQualityState.selected = IPTV_HLS_NO_VARIANT;
+        for (unsigned i = 0; i < master->variant_count; ++i)
+            if (iptv_hls_select_variant(master, limits, ~(UINT32_C(1) << i)) == i)
+            {
+                quality_indices[i] = gQualityState.count;
+                gQualityState.variants[gQualityState.count++] =
+                    iptv_hls_quality(&master->variants[i]);
+            }
+    }
     std::uint32_t excluded = 0;
     while (candidates->count < master->variant_count)
     {
-        const std::uint32_t selected = iptv_hls_select_variant(master, limits, excluded);
+        const std::uint32_t selected =
+            iptv_hls_select_quality(master, limits, &preference, excluded);
         if (selected == IPTV_HLS_NO_VARIANT)
             break;
         excluded |= UINT32_C(1) << selected;
@@ -710,6 +731,7 @@ void BuildNativeCandidates(iptv_hls_playlist_t *master, const iptv_hls_limits_t 
             continue;
         std::snprintf(candidates->urls[candidates->count], IPTV_HLS_URL_BYTES, "%s",
                       master->variants[selected].url);
+        candidates->indices[candidates->count] = quality_indices[selected];
         ++candidates->count;
     }
 }
@@ -1194,8 +1216,13 @@ class StreamRunner
             }
         }
         iptv_input_poll();
-        if (gControls)
-            (void)gControls(gControlsContext, -1);
+        if (gControls && gControls(gControlsContext, -1) == 2)
+        {
+            playback_stop_requested_ = true;
+            if (adapter_.initialized)
+                iptv_native_backend_request_stop(&adapter_.backend);
+            return true;
+        }
         const bool overlay_chord =
             iptv_input_pressed(IPTV_INPUT_TOUCHPAD) && iptv_input_pressed(IPTV_INPUT_R1);
         if (overlay_chord && !overlay_chord_down_)
@@ -2163,6 +2190,9 @@ int OpenAndFeedSegment(const char *url, StreamRunner *runner, std::uint8_t *buff
     return -1;
 }
 
+int RunContainer(const char *url, StreamRunner *runner, const iptv::http::RequestHeaders *headers,
+                 const std::string *manifest);
+
 int RunHlsMedia(const char *source_url, StreamRunner *runner, std::uint8_t *read_buffer,
                 char *playlist_data, const iptv_hls_limits_t *limits, iptv_hls_playlist_t *playlist,
                 const iptv::http::RequestHeaders *headers)
@@ -2192,6 +2222,11 @@ int RunHlsMedia(const char *source_url, StreamRunner *runner, std::uint8_t *read
         const iptv_hls_result_t parsed =
             iptv_hls_parse(playlist_data, playlist_bytes, effective_url, std::strlen(effective_url),
                            limits, playlist);
+        if (parsed == IPTV_HLS_UNSUPPORTED_FMP4 && playlist->kind == IPTV_HLS_KIND_MEDIA)
+        {
+            const std::string manifest(playlist_data, playlist_bytes);
+            return RunContainer(effective_url, runner, headers, &manifest);
+        }
         if (parsed != IPTV_HLS_OK || playlist->kind != IPTV_HLS_KIND_MEDIA)
         {
             if (iptv::http::ResponseIndicatesGeographicBlock(playlist_data, playlist_bytes))
@@ -2328,7 +2363,7 @@ int RunHls(const char *source_url, StreamRunner *runner, std::uint8_t *read_buff
 
     const iptv_hls_result_t parsed = iptv_hls_parse(playlist_data, playlist_bytes, effective_url,
                                                     std::strlen(effective_url), &limits, playlist);
-    if (parsed != IPTV_HLS_OK)
+    if (parsed != IPTV_HLS_OK && parsed != IPTV_HLS_UNSUPPORTED_FMP4)
     {
         if (iptv::http::ResponseIndicatesGeographicBlock(playlist_data, playlist_bytes))
             SetLastPlaybackError(
@@ -2340,7 +2375,7 @@ int RunHls(const char *source_url, StreamRunner *runner, std::uint8_t *read_buff
     }
     if (playlist->kind == IPTV_HLS_KIND_MEDIA)
     {
-        if (gMediaSession)
+        if (gMediaSession || parsed == IPTV_HLS_UNSUPPORTED_FMP4)
         {
             const std::string manifest(playlist_data, playlist_bytes);
             result = RunContainer(effective_url, runner, headers, &manifest);
@@ -2366,7 +2401,12 @@ int RunHls(const char *source_url, StreamRunner *runner, std::uint8_t *read_buff
     BuildNativeCandidates(playlist, &limits, candidates);
     if (!candidates->count)
     {
-        SetLastPlaybackError("No H.264 or HEVC HLS quality is supported by this PS5 decoder.");
+        iptv_player_quality_state_t quality{};
+        iptv_player_quality_state(&quality);
+        SetLastPlaybackError(
+            quality.preference.bandwidth
+                ? "Selected HLS quality is unavailable and no compatible lower quality remains."
+                : "No H.264 or HEVC HLS quality is supported by this PS5 decoder.");
         delete candidates;
         delete playlist;
         return IPTV_HLS_NO_VARIANT_WITHIN_LIMITS;
@@ -2374,6 +2414,10 @@ int RunHls(const char *source_url, StreamRunner *runner, std::uint8_t *read_buff
 
     for (std::uint32_t index = 0; index < candidates->count; ++index)
     {
+        {
+            std::lock_guard lock(gQualityMutex);
+            gQualityState.selected = candidates->indices[index];
+        }
         if (index && !runner->Start())
         {
             result = -1;
@@ -2838,14 +2882,21 @@ int RunDirect(const char *url, StreamRunner *runner, std::uint8_t *read_buffer, 
 static int RunPlayerOnce(const char *url, const char *channel_name, const char *user_agent,
                          const char *referrer, unsigned stop_after_ms, bool reconnect_live,
                          bool live, const char *authorization = nullptr,
-                         const char *credential_origin = nullptr)
+                         const char *credential_origin = nullptr,
+                         const char *extra_headers = nullptr)
 {
+    {
+        std::lock_guard lock(gQualityMutex);
+        gQualityState.count = 0;
+        gQualityState.selected = IPTV_HLS_NO_VARIANT;
+    }
     const std::uint64_t playback_started_us = MonotonicUsec();
     {
         std::lock_guard lock(gMediaMutex);
         gMediaState = {};
         gMediaState.position_us = gMediaStartPosition.load();
-        gMediaPauseRequest = -1;
+        gMediaPauseRequest = gInitialPaused && !live ? 1 : -1;
+        gInitialPaused = false;
         gMediaSession = !live;
     }
     SetLastPlaybackError(nullptr);
@@ -2885,7 +2936,8 @@ static int RunPlayerOnce(const char *url, const char *channel_name, const char *
 
     iptv::http::RequestHeaders headers{user_agent, referrer};
     headers.authorization = authorization;
-    headers.credential_origin = credential_origin;
+    headers.credential_origin = credential_origin ? credential_origin : url;
+    headers.extra_headers = extra_headers;
     auto *runner = new (std::nothrow) StreamRunner{};
     auto *read_buffer = new (std::nothrow) std::uint8_t[kNetworkReadBytes];
     auto *playlist_data = new (std::nothrow) char[kPlaylistBytes + 1u];
@@ -2901,7 +2953,8 @@ static int RunPlayerOnce(const char *url, const char *channel_name, const char *
         runner->SetLive(live);
 #if IPTV_PROBE
         if (!UrlLooksLikeHls(url) && !UrlLooksLikeWebm(url))
-            RunCurlDownloadProbe(url, headers, runner);
+            if (!headers.extra_headers || !*headers.extra_headers)
+                RunCurlDownloadProbe(url, headers, runner);
 #endif
         if (runner->PlaybackStopRequested())
             result = 1;
@@ -3011,7 +3064,8 @@ static int RunPlayerOnce(const char *url, const char *channel_name, const char *
 
 static int RunPlayer(const char *url, const char *channel_name, const char *user_agent,
                      const char *referrer, unsigned stop_after_ms, bool reconnect_live, bool live,
-                     const char *authorization = nullptr, const char *credential_origin = nullptr)
+                     const char *authorization = nullptr, const char *credential_origin = nullptr,
+                     const char *extra_headers = nullptr)
 {
     const auto began = MonotonicUsec();
     for (;;)
@@ -3024,8 +3078,9 @@ static int RunPlayer(const char *url, const char *channel_name, const char *user
                 return 1;
             remaining -= static_cast<unsigned>(elapsed);
         }
-        const int result = RunPlayerOnce(url, channel_name, user_agent, referrer, remaining,
-                                         reconnect_live, live, authorization, credential_origin);
+        const int result =
+            RunPlayerOnce(url, channel_name, user_agent, referrer, remaining, reconnect_live, live,
+                          authorization, credential_origin, extra_headers);
         const auto target = gMediaSeekRequest.exchange(-1, std::memory_order_acq_rel);
         iptv_player_media_state_t media{};
         iptv_player_media_state(&media);
@@ -3033,6 +3088,7 @@ static int RunPlayer(const char *url, const char *channel_name, const char *user
         {
             // A stale bookmark or a server refusing ranges must not prevent watching the film.
             gMediaStartPosition.store(0);
+            gInitialPaused = media.paused != 0;
             continue;
         }
         if (live || target < 0 || result < 0)
@@ -3040,11 +3096,13 @@ static int RunPlayer(const char *url, const char *channel_name, const char *user
         // Reopen after normal teardown: never mix old queued pictures or mux DTS with a seek.
         gMediaStartPosition.store(static_cast<std::uint64_t>(target));
         gMediaRestoreAudio.store(gMediaSavedAudio);
+        gInitialPaused = media.paused != 0;
     }
 }
 
 void iptv_player_set_start_position(uint64_t position_us)
 {
+    gInitialPaused = false;
     gMediaStartPosition.store(std::min<std::uint64_t>(position_us, INT64_MAX / 4));
     gAudioDelayMs.store(0);
     gPlaybackSpeed.store(100);
@@ -3114,6 +3172,15 @@ int iptv_player_run_authenticated(const char *url, const char *channel_name, con
 {
     return RunPlayer(url, channel_name, user_agent, referrer, stop_after_ms, reconnect_live != 0,
                      live != 0, authorization, credential_origin);
+}
+
+int iptv_player_run_configured(const char *url, const char *channel_name, const char *user_agent,
+                               const char *referrer, const char *authorization,
+                               const char *credential_origin, const char *extra_headers,
+                               unsigned stop_after_ms, int reconnect_live, int live)
+{
+    return RunPlayer(url, channel_name, user_agent, referrer, stop_after_ms, reconnect_live != 0,
+                     live != 0, authorization, credential_origin, extra_headers);
 }
 
 const char *iptv_player_last_error(void)
@@ -3226,4 +3293,25 @@ int iptv_player_run(const char *url, const char *channel_name)
 int iptv_player_run_controlled(const char *url, const char *channel_name, unsigned stop_after_ms)
 {
     return RunPlayer(url, channel_name, nullptr, nullptr, stop_after_ms, false, false);
+}
+
+extern "C" void iptv_player_quality_state(iptv_player_quality_state_t *state)
+{
+    if (!state)
+        return;
+    std::lock_guard lock(gQualityMutex);
+    *state = gQualityState;
+}
+extern "C" void iptv_player_set_quality(const iptv_hls_quality_t *quality)
+{
+    std::lock_guard lock(gQualityMutex);
+    gQualityState.preference = quality ? *quality : iptv_hls_quality_t{};
+}
+
+extern "C" void iptv_player_set_initial_controls(int paused, unsigned speed, int delay)
+{
+    gInitialPaused = paused != 0;
+    if (speed == 50 || speed == 75 || speed == 100 || speed == 125 || speed == 150 || speed == 200)
+        gPlaybackSpeed.store(speed);
+    gAudioDelayMs.store(std::clamp(delay, -2000, 2000));
 }

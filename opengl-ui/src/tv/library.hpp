@@ -4,6 +4,7 @@
 
 #pragma once
 
+#include "iptv_catalog.h"
 #include <cstdint>
 #include <string>
 #include <string_view>
@@ -30,6 +31,15 @@ enum class RefreshSchedule : int
 bool refresh_due(RefreshSchedule schedule, std::uint64_t saved, std::uint64_t now);
 const char *schedule_name(RefreshSchedule schedule);
 
+struct AccountInfo
+{
+    std::int64_t expires_unix = -1;
+    std::int64_t max_connections = -1;
+    std::int64_t checked_unix = 0;
+};
+// Positive: days remaining (rounded up) within one week, -1: expired, 0: no warning.
+int account_expiry_notice(const AccountInfo &info, std::uint64_t now);
+
 // IDs 1..3 are the original built-in, playlist and Xtream source slots.
 // Subsequent records allow any number of playlists and accounts.
 struct SavedSource
@@ -42,6 +52,8 @@ struct SavedSource
     std::string password;
     std::string mac;
     RefreshSchedule schedule = RefreshSchedule::daily;
+    AccountInfo account{};
+    std::string user_agent{}, referrer{}, extra_headers{};
 };
 bool valid_source(const SavedSource &source);
 
@@ -53,6 +65,13 @@ struct ChannelHistory
 {
     std::int64_t first_seen = 0;
     std::int64_t watches = 0;
+};
+
+struct ResumeItem
+{
+    iptv::Channel channel;
+    std::string series;
+    std::uint64_t position_us = 0, duration_us = 0;
 };
 
 class Library
@@ -71,6 +90,12 @@ class Library
     std::vector<SavedSource> sources() const;
     bool save_source(SavedSource *source);
     bool remove_source(std::int64_t id);
+    bool save_account_info(std::int64_t source, const AccountInfo &info);
+    std::string guide_url(std::int64_t source) const;
+    std::map<std::string, std::string> guide_mapping(std::int64_t source) const;
+    bool set_guide_url(std::int64_t source, std::string_view url);
+    bool set_guide_mapping(std::int64_t source, std::string_view channel,
+                           std::string_view guide_id);
     std::int64_t selected_source() const;
     bool select_source(std::int64_t id);
     bool observe_channels(std::int64_t source, const iptv::Catalog &catalog, std::int64_t now);
@@ -80,6 +105,10 @@ class Library
     bool remember_channel(std::int64_t source, std::string_view channel);
     std::pair<std::int64_t, std::string> last_channel() const;
     std::pair<std::uint64_t, std::uint64_t> playback_progress(std::string_view channel) const;
+    bool remember_vod(std::int64_t source, std::uint64_t fingerprint,
+                      const iptv::ChannelView &channel, std::string_view series,
+                      std::int64_t updated);
+    std::vector<ResumeItem> unfinished_vod(std::int64_t source, std::uint64_t fingerprint) const;
     bool save_playback_progress(std::string_view channel, std::uint64_t position_us,
                                 std::uint64_t duration_us);
     std::unordered_set<std::string> hidden_categories(std::uint64_t source) const;

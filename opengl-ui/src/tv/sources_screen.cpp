@@ -4,10 +4,13 @@
 
 #include "tv/i18n.hpp"
 #include "tv/sources_screen.hpp"
+#include "tv/usb_playlist.hpp"
 #include "tv/draw.hpp"
 #include "tv/stream_sniff.hpp"
+#include "tv/platform.hpp"
 
 #include <algorithm>
+#include <ctime>
 
 namespace ptv
 {
@@ -15,6 +18,20 @@ namespace
 {
 constexpr Rect kList{kMargin, 250, 1010, 670};
 constexpr Rect kPanel{1144, 250, kWidth - kMargin - 1144, 640};
+
+std::string account_date(std::int64_t stamp)
+{
+    if (stamp < 0)
+        return tr("Not supplied");
+    if (stamp == 0)
+        return tr("No expiry reported");
+    const auto seconds = static_cast<std::time_t>(stamp);
+    char text[32]{};
+    const auto *utc = std::gmtime(&seconds);
+    if (utc && std::strftime(text, sizeof(text), "%Y-%m-%d UTC", utc))
+        return text;
+    return tr("Not supplied");
+}
 
 const char *source_title(const SavedSource &source)
 {
@@ -57,6 +74,12 @@ void SourcesScreen::sync()
         row.subtitle = source.url.empty() && source.kind != 0 ? tr("Press Cross to set up")
                                                               : tr(schedule_name(source.schedule));
         row.badge = source.id == model.selected_source_id() ? tr("In use") : "";
+        if (source.kind == 2)
+        {
+            const auto days = account_expiry_notice(source.account, platform::unix_time());
+            if (days)
+                row.badge = days < 0 ? tr("Expired") : tr("Expires soon");
+        }
         rows.push_back(std::move(row));
         ids_.push_back(source.id);
     }
@@ -85,6 +108,20 @@ void SourcesScreen::sync()
     server.subtitle = tr("HTTP address and optional account");
     rows.push_back(std::move(server));
     ids_.push_back(-5);
+    ui::ListItem usb;
+    usb.title = tr("Find playlists on USB");
+    usb.subtitle = tr("Top-level .m3u and .m3u8 files on connected drives");
+    rows.push_back(std::move(usb));
+    ids_.push_back(-6);
+    usb_files_ = usb_playlists(model.usb_root());
+    for (std::size_t i = 0; i < usb_files_.size(); ++i)
+    {
+        ui::ListItem row;
+        row.title = tr("Import ") + usb_files_[i].substr(10);
+        row.subtitle = usb_files_[i];
+        rows.push_back(std::move(row));
+        ids_.push_back(-100 - static_cast<std::int64_t>(i));
+    }
     list_.set_items(std::move(rows));
     list_.set_focus(std::clamp(focus, 0, static_cast<int>(ids_.size()) - 1), true);
     seen_revision_ = model.revision();
@@ -106,6 +143,16 @@ void SourcesScreen::handle(const InputFrame &input, ui::Feedback &feedback)
 {
     auto &model = shared_.model;
     const auto id = focused_id();
+    if (input.is_pressed(Action::jump_next) && id > 1)
+    {
+        model.edit_source_http(id);
+        return;
+    }
+    if (input.is_pressed(Action::jump_prev) && id > 0)
+    {
+        model.edit_guide_url(id);
+        return;
+    }
     if (input.is_pressed(Action::north) && id > 1)
     {
         model.edit_saved_source(id);
@@ -125,7 +172,21 @@ void SourcesScreen::handle(const InputFrame &input, ui::Feedback &feedback)
     }
     if (list_.handle(input, feedback) == ui::Event::activated)
     {
-        if (id < 0)
+        if (id == -6)
+        {
+            sync();
+            model.announce(Level::ready,
+                           usb_files_.empty() ? tr("No USB playlists found")
+                                              : tr("Choose a playlist below"),
+                           tr("Use the root of a USB drive, with .m3u or .m3u8 files."), 4);
+        }
+        else if (id <= -100)
+        {
+            const auto index = static_cast<std::size_t>(-100 - id);
+            if (index < usb_files_.size())
+                model.import_usb_playlist(usb_files_[index]);
+        }
+        else if (id < 0)
             model.add_source(static_cast<iptv::SourceKind>(-id));
         else
             model.use_saved_source(id);
@@ -151,6 +212,10 @@ void SourcesScreen::draw(ui::Canvas &canvas) const
              tone::accent, gfx::Align::left, 4);
     ui::text(draw, fonts.display, tr("Sources"), kMargin - 3, 224, 60, theme.text);
     list_.draw(canvas);
+    const auto focused = list_.row_rect(list_.focus());
+    draw.push_clip(kList);
+    draw.rounded_rect({focused.x + 7, focused.y + 14, 5, focused.h - 28}, 2, tone::accent);
+    draw.pop_clip();
     draw_glass(canvas, theme, kPanel, 26);
     const float left = kPanel.x + 36, width = kPanel.w - 72;
     const auto id = focused_id();
@@ -158,6 +223,16 @@ void SourcesScreen::draw(ui::Canvas &canvas) const
     const std::string title = source != nullptr ? source_title(*source) : tr("Add a source");
     ui::text(draw, fonts.display, fonts.display.font->fit(title, 36, width), left, 315, 36,
              theme.text);
+    if (source == nullptr && (id == -6 || id <= -100))
+    {
+        ui::paragraph(draw, fonts.regular,
+                      tr("Import a playlist from the root of /mnt/usb0 through /mnt/usb7. "
+                         "Channels are saved in the app. Updates reread the same USB path; "
+                         "keep that drive connected when refreshing. Missing drives leave the "
+                         "last saved channels available. New USB sources use manual refresh."),
+                      left, 375, 26, width, 38, theme.text_muted, 12);
+        return;
+    }
     if (source == nullptr)
     {
         ui::paragraph(
@@ -171,13 +246,46 @@ void SourcesScreen::draw(ui::Canvas &canvas) const
                                 : source->url.empty() ? tr("Not set up")
                                                       : redact_address(source->url);
     ui::paragraph(draw, fonts.regular, address, left, 375, 24, width, 34, theme.text_muted, 3);
+    const auto guide_url = model.guide_url_override(id);
+    if (!guide_url.empty())
+        ui::text(draw, fonts.regular,
+                 fonts.regular.font->fit(tr("XMLTV: ") + redact_address(guide_url), 20, width),
+                 left, 488, 20, theme.text_muted);
     ui::text(draw, fonts.semibold,
              tr("Refresh: ") + std::string(tr(schedule_name(source->schedule))), left, 510, 26,
              theme.text);
-    ui::paragraph(draw, fonts.regular,
-                  tr("Square changes the schedule. A saved list opens immediately; a download runs "
-                     "only when due or when requested."),
-                  left, 563, 24, width, 34, theme.text_muted, 4);
+    if (source->kind == 2)
+    {
+        const auto &info = source->account;
+        const auto line = [&](const std::string &text, float y)
+        {
+            ui::text(draw, fonts.regular, fonts.regular.font->fit(text, 22, width), left, y, 22,
+                     theme.text_muted);
+        };
+        line(tr("Expires: ") + account_date(info.expires_unix), 563);
+        line(tr("Connection limit: ") + (info.max_connections < 0 ? std::string(tr("Not supplied"))
+                                         : info.max_connections == 0
+                                             ? std::string(tr("No limit reported"))
+                                             : std::to_string(info.max_connections)),
+             607);
+        const int days = account_expiry_notice(info, platform::unix_time());
+        if (days)
+            line(days < 0 ? tr("Account expiry date has passed")
+                          : tr("Account expires within a week"),
+                 651);
+        else if (!info.checked_unix)
+            line(tr("Details are checked on the next refresh."), 651);
+        if (info.checked_unix)
+            line(tr("Last checked: ") + account_date(info.checked_unix), 695);
+    }
+    else
+    {
+        ui::paragraph(
+            draw, fonts.regular,
+            tr("Square changes the schedule. A saved list opens immediately; a download runs "
+               "only when due or when requested."),
+            left, 563, 24, width, 34, theme.text_muted, 4);
+    }
     if (id == model.selected_source_id())
     {
         ui::text(draw, fonts.semibold, group_digits(model.channel_count()) + tr(" channels"), left,
@@ -201,7 +309,12 @@ int SourcesScreen::hints(ui::Hint *out, int capacity) const
     if (focused_id() > 1)
         add({ui::Button::triangle, tr("Edit")});
     if (focused_id() > 0)
+    {
         add({ui::Button::square, tr("Refresh schedule")});
+        add({ui::Button::l2, tr("XMLTV guide")});
+    }
+    if (focused_id() > 1)
+        add({ui::Button::r2, tr("HTTP settings")});
     return count;
 }
 } // namespace ptv

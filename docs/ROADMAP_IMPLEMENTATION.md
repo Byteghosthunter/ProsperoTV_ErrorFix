@@ -77,7 +77,8 @@ the last good cache. External XML entities are not expanded.
 
 ## On demand
 
-Select an Xtream account, then open On demand. Movies and TV shows have
+Select an Xtream account or a classified M3U playlist, then open On demand
+beside Live TV. Movies and TV shows have
 provider categories, including subcategories and the source's visibility
 choices. Shows open seasons and numerically ordered episodes. Triangle searches
 the current list; Options refreshes it. Lists and episode catalogues have
@@ -89,8 +90,9 @@ still decoded by the native backend; supported audio uses the existing audio
 pipeline. The later audio/subtitle work adds track selection and supported HLS
 renditions; its limits and validation are recorded in the roadmap status. DRM,
 encrypted HLS and unsupported video codecs remain outside this implementation.
-The On demand provider API currently supports Xtream, while MAC portals provide
-live channels.
+The On demand provider API supports Xtream. Extended M3U playlists also supply
+movies and episodes when their entries identify the media type; these use the
+playlist cache and each entry's playback headers. MAC portals provide live channels.
 
 ## Original source/browsing/guide validation
 
@@ -130,3 +132,147 @@ fixes, native cases and integrated acceptance.
   stop correction and repeats VOD and portal playback.
 - No real provider credentials were supplied. Protocol compatibility is tested
   with synthetic responses, not claimed for every provider.
+
+
+### USB playlist files (host implementation; native acceptance pending)
+
+Sources offers **Find playlists on USB** and import rows for top-level `.m3u` / `.m3u8`
+files under the normal `/mnt/usb0` through `/mnt/usb7` mounts. Imports become independent
+saved Custom sources; existing playlists and accounts are retained. New USB sources default
+to manual refresh. Their parsed catalogue is stored privately in the app, so saved channels
+remain available after disconnecting the drive or restarting. Refresh rereads the original
+USB path; daily/weekly schedules apply if selected. A missing drive or failed read keeps the
+last good catalogue. Reconnect the same drive at the same mount path to update it; importing
+the same path selects and refreshes its existing source. Playlist media addresses must still
+be HTTP(S); this feature does not import local video files or follow relative video paths.
+
+Discovery examines at most 4096 entries per drive and offers at most 64 playlist files.
+Names are at most 128 bytes. Only root-level regular files are accepted; hidden names,
+traversal, symlinks, directories and special files are excluded. Reads stream in 64 KiB chunks,
+with the existing 512 MiB playlist bound, catalogue limits and cancellation. File changes,
+short reads and mount changes fail without replacing the cache. No elevated USB namespace is
+used. Physical drive recognition and native interaction remain unverified.
+
+
+### Custom XMLTV and channel matching (host implementation; native acceptance pending)
+
+On Sources, L2 edits that source's HTTP(S) XMLTV address. Empty restores the provider's
+playlist/account guide. In the full guide, Options > Match XMLTV channel edits the selected
+visible live channel's XMLTV `channel` ID; use the ID from the guide, not its display name.
+Empty restores automatic `tvg-id` and unambiguous-name matching. Explicit matches take
+priority, and several live channels can share one guide ID. An unknown guide ID produces
+no programmes for that channel rather than guessing a replacement. There is no station
+picker: matching uses the focused ID input.
+
+Overrides and up to 4096 explicit matches per source persist in the private Library database
+(and its existing backup). Guide IDs are limited to 256 bytes. Source account/address changes
+clear their old guide configuration; renaming a source retains it. The saved guide validates
+both source identity and the URL/mapping fingerprint, using one guide database per source
+rather than accumulating a new cache after each edit. Editing configuration invalidates old
+programme assignments immediately; successful downloads save the replacement. Offline restart
+keeps the last good guide only when its configuration still matches. Existing parental and
+hidden-channel filtering remains authoritative. Native keyboard/display acceptance is pending.
+### Home episode continuation (host implementation; native acceptance pending)
+
+Resuming an episode from Home prepares an independent series list, without moving
+On Demand to that show. A saved list is usable immediately, including offline. If
+it is missing, one series request runs through the shared menu download gate while
+controller input remains active. Circle, changing tabs, choosing another source or
+refreshing cancels the pending playback. After at most ten seconds plus request
+cancellation, the saved episode starts even if its series could not be downloaded;
+a warning explains that automatic continuation is unavailable. A later Home resume
+retries the missing list. There is no background retry during foreground playback.
+
+At normal end-of-file, the next episode in provider season/episode order is queued
+only for the same source record, source fingerprint and current series episode.
+Playlist episodes retain their bounded category/title series key across restart.
+Hidden channels/categories, inherited show restrictions and current parental rules
+are checked again. A locked next episode is not skipped. Its own stream URLs and
+HTTP headers are retained. Manual stops, playback failures, sleeping, and the final
+episode do not advance. The independent list remains available when menu workers
+are closed for foreground playback.
+
+Native acceptance still needs a restarted app: resume an unfinished episode from
+Home, seek near its end, and confirm the next episode starts while On Demand keeps
+its previous selection. Also verify saved-cache playback offline, Circle/source
+change during a missing-list request, and fallback to the saved stream when that
+request fails. Host tests cover these model transitions and the ten-second bound;
+they do not establish console playback or controller behavior.
+### Phone channel and guide pages (host implemented; native acceptance pending)
+
+A paired phone can open Channels and guide, search channel names/categories and programmes
+on now, page through up to 40 live channels, see now/next, read up to 48 upcoming programmes
+per guide page, and tap a channel to play it on TV. Responses contain channel IDs/display text
+and programme times, never stream URLs or provider credentials. DOM text nodes display provider
+content. Existing TV keyboard-search and remote controls remain available.
+
+The authenticated `/api/browse` POST endpoint applies the existing pairing cookie and custom
+header requirements. It limits request size and page output, validates source identity on guide,
+paging and tuning requests, and rechecks parental/hidden/failed-channel policy before returning
+channel data or playing. During playback a read-only view borrows the stopped Model's catalogue
+and guide and copies visibility marks, order and renamed labels once. Menu requests borrow
+those existing arrays synchronously, so a small page does not copy or recheck the entire source.
+The synchronous polling handler records a selection without mutating the Model. Idle player polling honors the normal
+stop-for-switch result; the handler detaches immediately after playback, before its view can
+expire. The Model then rechecks source and content policy before queuing the channel. Tapping
+the current channel does not restart it. A phone switch saves VOD progress without advancing
+to the next episode. Source editing still requires the menu. Host tests cover stopped-Model
+browsing/search/guide, deferred tuning, blocked selection and final policy/source revalidation.
+Native acceptance remains pending; roadmap stays unchecked.
+
+A host ASan/UBSan benchmark with 250,000 generated live channels and ten first-page requests
+measured 199,472 microseconds per request before borrowing menu visibility data and 177 after.
+The regression checks that menu views hold no owned catalogue-sized arrays/maps; timing is
+reported, not used as a flaky pass/fail limit. PIN-prompt snapshots reject browsing, and moved
+playback snapshots retain renamed labels and visibility independently of later menu changes.
+
+### Manual HLS quality (host implementation, console acceptance pending)
+
+Playback Options now has a Quality tab listing compatible master-playlist variants and the
+currently attempted/playing selection. Best available uses the existing resolution/codec/bitrate
+ranking; it is not bandwidth-adaptive streaming. Direct files, media playlists and single-quality
+masters explain that no alternative is supplied. Choices last for the current foreground stream.
+
+Changing quality cleanly closes the player, preserves the full authenticated request, VOD
+position, pause state, speed and audio delay, then re-fetches the original master. Audio and
+subtitle selections are matched by language/title/accessibility role, with stable-ID fallback
+only when metadata is absent. Missing audio leaves the replacement default playing with a notice;
+missing subtitles stay off with a notice. An explicit Audio Off choice remains off. Live playback
+restarts at the live edge and discards its replay buffer. Phone channel selection takes priority.
+Quality changes save progress without marking completion or advancing
+episodes.
+
+The fresh master must contain a compatible descriptor, or a compatible fallback no larger in
+resolution or advertised bandwidth. Reordering cannot silently pick a different numeric index.
+Recognized, fully validated unencrypted fragmented-MP4 media playlists now use the container
+path; encryption encountered after EXT-X-MAP still fails explicitly. Direct MP4 stays a single
+quality and the existing bounded manifest/HTTP origin policy remains in force.
+
+Native acceptance: exercise a multi-variant TS live stream and fragmented-MP4 VOD; change down
+and up while paused and while playing, verify position/tracks/speed/delay and unchanged headers,
+then reorder/remove the selected variant and fail its segment requests to check bounded fallback.
+Check direct MP4 and single-quality HLS, encrypted rejection, Circle cancellation, simultaneous
+phone selection, and long translated Quality panels. This change has no hardware verification.
+
+
+### Surround sound feasibility (not implemented)
+
+The current FFmpeg build can decode multichannel AAC/AC-3/E-AC-3, but the decoder,
+limiter, native sink, tempo wrapper and loudness normalizer deliberately produce or assume
+stereo. A 5.1 implementation needs explicit layout propagation, larger bounded PCM buffers,
+channel-aware processing and a verified mapping into an eight-slot native output port.
+
+The installed SDK v0.42 exports the AudioOut Ex configuration and HDMI monitor-query
+functions, without typed headers. Public [PS5 Audio Passthrough Research](https://github.com/sainsaji/PS5-Audio-Passthrough-Research/tree/c3be9c2afcb8f7838784ead0fe1c12a2ceea965a)
+reports sandboxed 5.1 PCM on PS5 Pro firmware 12.70. Its [output implementation](https://github.com/sainsaji/PS5-Audio-Passthrough-Research/blob/c3be9c2afcb8f7838784ead0fe1c12a2ceea965a/sample-app/src/platform/ps5/bitstream_out.cpp)
+uses standard AudioOut format 2 and HDMI mode 6. However, its capability-buffer offsets
+come from one firmware dump, and HDMI capabilities do not establish the active headphone,
+USB or HDMI route. These are not sufficient evidence for an automatic surround switch.
+Keep stereo until the target firmware's capability structure, active route, speaker order,
+stereo-only fallback, hotplug and repeated switching are verified on hardware.
+
+Encoded passthrough is a separate larger change: bounded IEC61937 packing, receiver delay,
+exclusive output ownership and defined volume/normalization/speed behavior. The upstream
+[findings](https://github.com/sainsaji/PS5-Audio-Passthrough-Research/blob/c3be9c2afcb8f7838784ead0fe1c12a2ceea965a/docs/FINDINGS.md)
+also report unresolved receiver lockups after repeated format changes. No surround setting,
+new dependency or console probe was added for this investigation.

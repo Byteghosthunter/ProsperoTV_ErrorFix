@@ -4,6 +4,7 @@
 
 #include "tv/i18n.hpp"
 #include "tv/model.hpp"
+#include "tv/usb_playlist.hpp"
 #include "tv/category_path.hpp"
 #include "tv/platform.hpp"
 #include "tv/settings.hpp"
@@ -53,6 +54,7 @@ void Model::load_library()
         select_source_record(*source);
     else
         selected_source_id_ = 1;
+    warn_account_expiry();
 }
 
 const SavedSource *Model::saved_source(std::int64_t id) const
@@ -65,6 +67,7 @@ const SavedSource *Model::saved_source(std::int64_t id) const
 
 void Model::select_source_record(const SavedSource &source)
 {
+    clear_home_playback();
     end_search();
     const bool changed = selected_source_id_ != source.id;
     selected_source_id_ = source.id;
@@ -75,11 +78,13 @@ void Model::select_source_record(const SavedSource &source)
     if (source.kind == 2)
         xtream_ = {source.url, source.username, source.password};
     if (source.kind == 3)
-        portal_ = {source.url, source.mac};
+        portal_ = {source.url, source.mac, source.user_agent, source.referrer,
+                   source.extra_headers};
     if (source.kind >= 4)
         local_source_ = source;
     vod_.configure(source.kind == 2 ? xtream_ : iptv::XtreamCredentials{},
-                   cache_path(active_source_), schedule_);
+                   cache_path(active_source_), schedule_, source.user_agent, source.referrer,
+                   source.extra_headers);
     if (source.kind == 1)
         vod_.configure_playlist(&catalog_);
     if (changed)
@@ -104,6 +109,132 @@ bool Model::refresh_needed() const
     if (catalog_loaded_ && schedule_ == RefreshSchedule::manual)
         return false;
     return !catalog_loaded_ || refresh_due(schedule_, saved_unix_, platform::unix_time());
+}
+
+void Model::apply_source_http(PlayRequest &request) const
+{
+    if (const auto *source = saved_source(selected_source_id_))
+    {
+        request.extra_headers = source->extra_headers;
+        // USB lists have no HTTP origin; playback scopes to each initial stream URL.
+        if (!usb_playlist_path(source->url) && !request.extra_headers.empty() &&
+            request.credential_origin.empty())
+            request.credential_origin = source->url;
+        if (request.user_agent.empty())
+            request.user_agent = source->user_agent;
+        if (request.referrer.empty())
+            request.referrer = source->referrer;
+    }
+}
+
+void Model::edit_source_http(std::int64_t id)
+{
+    if (!require_parent() || refreshing() || iptv_ime_busy() || !keyboard_ready_ ||
+        account_step_ != AccountStep::none)
+        return;
+    const auto *source = saved_source(id);
+    if (!source || source->kind == 0)
+        return;
+    if (source->user_agent.size() > IPTV_IME_BUFFER_CHARACTERS ||
+        source->referrer.size() > IPTV_IME_BUFFER_CHARACTERS)
+    {
+        notify(Level::warning, tr("Edit long HTTP settings from the paired phone"));
+        return;
+    }
+    http_form_ = *source;
+    account_step_ = AccountStep::http_user_agent;
+    account_prompt_pending_ = true;
+}
+
+void Model::on_http_user_agent(const char *text, void *self)
+{
+    if (!self)
+        return;
+    auto &model = *static_cast<Model *>(self);
+    if (!text)
+    {
+        model.account_step_ = AccountStep::none;
+        model.http_form_ = {};
+        return;
+    }
+    model.http_form_.user_agent = text;
+    model.account_step_ = AccountStep::http_referrer;
+    model.account_prompt_pending_ = true;
+}
+
+void Model::on_http_referrer(const char *text, void *self)
+{
+    if (!self)
+        return;
+    auto &model = *static_cast<Model *>(self);
+    if (!text)
+    {
+        model.account_step_ = AccountStep::none;
+        model.http_form_ = {};
+        return;
+    }
+    model.http_form_.referrer = text;
+    model.account_step_ = AccountStep::http_extra;
+    model.account_prompt_pending_ = true;
+}
+
+void Model::on_http_extra(const char *text, void *self)
+{
+    if (!self)
+        return;
+    auto &model = *static_cast<Model *>(self);
+    if (!text)
+    {
+        model.account_step_ = AccountStep::none;
+        model.http_form_ = {};
+        return;
+    }
+    const std::string line(text);
+    if (!line.empty())
+    {
+        std::vector<iptv::http::NamedHeader> incoming, existing;
+        bool valid = line == "-";
+        std::string updated;
+        if (!valid && line.find('\n') == line.npos &&
+            iptv::http::ParseExtraHeaders(line, &incoming) && incoming.size() == 1 &&
+            iptv::http::ParseExtraHeaders(model.http_form_.extra_headers, &existing))
+        {
+            const auto lower = [](std::string value)
+            {
+                for (char &c : value)
+                    if (c >= 'A' && c <= 'Z')
+                        c += 'a' - 'A';
+                return value;
+            };
+            for (const auto &field : existing)
+                if (lower(field.name) != lower(incoming[0].name))
+                    updated += field.name + ": " + field.value + "\n";
+            updated += incoming[0].name + ": " + incoming[0].value;
+            valid = iptv::http::ParseExtraHeaders(updated);
+        }
+        if (valid)
+            model.http_form_.extra_headers = std::move(updated);
+        else
+            model.notify(Level::warning, tr("Invalid HTTP header"));
+        model.account_prompt_pending_ = true;
+        return;
+    }
+    model.account_step_ = AccountStep::none;
+    model.commit_source(model.http_form_);
+    model.http_form_ = {};
+}
+
+void Model::warn_account_expiry()
+{
+    const auto *source = saved_source(selected_source_id_);
+    if (!source || source->kind != 2)
+        return;
+    const int days = account_expiry_notice(source->account, platform::unix_time());
+    if (days)
+        notify(Level::warning,
+               days < 0 ? tr("Account expiry date has passed")
+                        : tr("Account expires within a week"),
+               source->name + ". " + tr("Check the account details in Sources."));
 }
 
 void Model::use_saved_source(std::int64_t id)
@@ -142,6 +273,7 @@ void Model::use_saved_source(std::int64_t id)
         refresh();
     else
         set_status(tr("Saved copy"), Level::ready);
+    warn_account_expiry();
 }
 
 void Model::add_source(iptv::SourceKind kind)
@@ -366,7 +498,8 @@ bool Model::set_schedule(std::int64_t id, RefreshSchedule schedule)
         schedule_ = schedule;
         vod_.configure(active_source_ == iptv::SourceKind::Xtream ? xtream_
                                                                   : iptv::XtreamCredentials{},
-                       cache_path(active_source_), schedule_);
+                       cache_path(active_source_), schedule_, next.user_agent, next.referrer,
+                       next.extra_headers);
         if (active_source_ == iptv::SourceKind::Custom)
             vod_.configure_playlist(&catalog_);
     }
@@ -381,8 +514,21 @@ bool Model::play_vod(unsigned index)
     const auto item = vod_.catalog()[index];
     return queue_vod(item, vod_.kind() == VodKind::episodes ? vod_.series() : std::string());
 }
-bool Model::queue_vod(const iptv::ChannelView &item, const std::string &series)
+bool Model::queue_vod(const iptv::ChannelView &item, const std::string &series, bool inherit_series)
 {
+    if (inherit_series)
+        clear_home_playback();
+    auto snapshot = item.Copy();
+    if (inherit_series && !series.empty())
+    {
+        snapshot.group_title = view.vod_series_group;
+        snapshot.adult = snapshot.adult || view.vod_series_adult;
+        if (!view.vod_series_name.empty())
+            snapshot.name = view.vod_series_name + " / " + snapshot.name;
+    }
+    if (!library_.remember_vod(selected_source_id_, source_id(active_source_), snapshot, series,
+                               static_cast<std::int64_t>(platform::unix_time())))
+        notify(Level::warning, tr("Continue watching could not be saved"), "");
     sleep_timer.wake();
     play_request_ = {};
     play_request_.channel_id = item.id;
@@ -394,6 +540,7 @@ bool Model::queue_vod(const iptv::ChannelView &item, const std::string &series)
     play_request_.source_id = item.source_id;
     play_request_.user_agent = item.http_user_agent;
     play_request_.referrer = item.http_referrer;
+    apply_source_http(play_request_);
     play_request_.record_channel_result = false;
     play_request_.on_demand = true;
     play_request_.start_position_us = library_.playback_progress(item.id).first;
@@ -404,7 +551,10 @@ bool Model::queue_vod(const iptv::ChannelView &item, const std::string &series)
 bool Model::save_vod_progress(std::string_view id, std::uint64_t position_us,
                               std::uint64_t duration_us)
 {
-    return library_.save_playback_progress(id, position_us, duration_us);
+    const bool saved = library_.save_playback_progress(id, position_us, duration_us);
+    if (saved)
+        ++revision_;
+    return saved;
 }
 
 bool Model::finish_vod(const PlayRequest &request, std::uint64_t position_us,
@@ -414,8 +564,10 @@ bool Model::finish_vod(const PlayRequest &request, std::uint64_t position_us,
         return false;
     if (!save_vod_progress(request.channel_id, completed ? 0 : position_us, duration_us))
         notify(Level::error, tr("Playback position could not be saved"), "");
-    if (!completed || sleep_timer.sleeping() || vod_.kind() != VodKind::episodes ||
-        request.series_id != vod_.series())
+    if (completed && !sleep_timer.sleeping() && home_source_ != 0)
+        return next_home_episode(request);
+    if (!completed || sleep_timer.sleeping() || request.source_id != source_id(active_source_) ||
+        vod_.kind() != VodKind::episodes || request.series_id != vod_.series())
         return false;
     const auto &catalog = vod_.catalog();
     const auto current = catalog.Find(request.channel_id);
@@ -696,5 +848,35 @@ bool Model::put_in_folder(std::string_view folder, unsigned index, bool included
     if (folder_ == folder)
         set_folder(folder_);
     return true;
+}
+} // namespace ptv
+
+namespace ptv
+{
+bool Model::import_usb_playlist(const std::string &file)
+{
+    if (!require_parent() || refreshing() || !usb_playlist_path(file))
+        return false;
+    const auto available = usb_playlists(usb_root_);
+    if (std::find(available.begin(), available.end(), file) == available.end())
+    {
+        notify(Level::error, tr("The USB playlist is no longer available"));
+        return false;
+    }
+    for (const auto &source : sources_)
+        if (source.kind == 1 && source.url == file)
+        {
+            use_saved_source(source.id);
+            refresh();
+            return true;
+        }
+    SavedSource source;
+    source.kind = 1;
+    source.name = file.substr(file.find_last_of('/') + 1);
+    if (source.name.size() > 128)
+        source.name.resize(128);
+    source.url = file;
+    source.schedule = RefreshSchedule::manual;
+    return commit_source(std::move(source));
 }
 } // namespace ptv

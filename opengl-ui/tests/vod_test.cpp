@@ -9,6 +9,8 @@
 #include "iptv_store.h"
 #include <gtest/gtest.h>
 #include <chrono>
+#include <algorithm>
+#include <ctime>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -92,6 +94,260 @@ class VodTest : public ::testing::Test
     int number = 0;
 };
 
+TEST_F(VodTest, HomeResumesOfflineWithoutLoadingVodAndRechecksHiddenAndParentalRules)
+{
+    std::string id;
+    {
+        ptv::Model model(dir);
+        ASSERT_TRUE(model.open());
+        model.vod().select(ptv::VodKind::movies);
+        ASSERT_TRUE(settle(model));
+        ASSERT_TRUE(model.play_vod(0));
+        ptv::PlayRequest request;
+        ASSERT_TRUE(model.take_play_request(&request));
+        id = request.channel_id;
+        EXPECT_FALSE(model.finish_vod(request, 12000000, 100000000, false));
+        model.close();
+    }
+    host::set_network(false, "");
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    EXPECT_EQ(model.vod().catalog().size(), 0u);
+    auto rows = model.home_items();
+    ASSERT_EQ(rows[0].size(), 1u);
+    EXPECT_EQ(rows[0][0].title, "Alpha movie");
+    EXPECT_EQ(rows[0][0].position_us, 12000000u);
+    ASSERT_TRUE(model.play_home(id, true));
+    ptv::PlayRequest request;
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_EQ(request.start_position_us, 12000000u);
+    EXPECT_EQ(request.urls[0], "https://provider.invalid/sub/movie/user%40home/p%26ss/10.mkv");
+    ASSERT_TRUE(model.hide_category("US / Movies", true));
+    EXPECT_TRUE(model.home_items()[0].empty());
+    EXPECT_FALSE(model.play_home(id, true));
+    ASSERT_TRUE(model.hide_category("US / Movies", false));
+    model.parental_action(ptv::Model::ParentalAction::set_pin);
+    model.poll();
+    host::set_keyboard_text("123456");
+    model.poll();
+    host::set_keyboard_text("123456");
+    model.poll();
+    model.parental_action(ptv::Model::ParentalAction::unlock);
+    model.poll();
+    host::set_keyboard_text("123456");
+    model.poll();
+    ASSERT_TRUE(model.set_category_rule("US / Movies", 1));
+    model.parental_action(ptv::Model::ParentalAction::lock);
+    EXPECT_TRUE(model.home_items()[0].empty());
+    EXPECT_FALSE(model.play_home(id, true));
+    model.parental_action(ptv::Model::ParentalAction::unlock);
+    model.poll();
+    host::set_keyboard_text("123456");
+    model.poll();
+    EXPECT_FALSE(model.home_items()[0].empty());
+    EXPECT_FALSE(model.finish_vod(request, 100000000, 100000000, true));
+    EXPECT_TRUE(model.home_items()[0].empty());
+    model.close();
+}
+
+TEST_F(VodTest, HomeEpisodesRetainTheirShowsParentalPolicyAcrossRestart)
+{
+    {
+        ptv::Model model(dir);
+        ASSERT_TRUE(model.open());
+        model.view.vod_series_group = "Comedy";
+        model.view.vod_series_adult = true;
+        model.view.vod_series_name = "Adult show";
+        model.vod().select(ptv::VodKind::episodes, "20");
+        ASSERT_TRUE(settle(model));
+        ASSERT_TRUE(model.play_vod(0));
+        ptv::PlayRequest request;
+        ASSERT_TRUE(model.take_play_request(&request));
+        EXPECT_FALSE(model.finish_vod(request, 10000000, 100000000, false));
+        model.close();
+    }
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    ASSERT_EQ(model.home_items()[0].size(), 1u);
+    const auto id = model.home_items()[0][0].id;
+    model.view.vod_series_group = "Another category";
+    model.view.vod_series_adult = false;
+    ASSERT_TRUE(model.play_home(id, true));
+    EXPECT_EQ(model.view.vod_series_group, "Another category");
+    EXPECT_FALSE(model.view.vod_series_adult);
+    ptv::PlayRequest resumed;
+    ASSERT_TRUE(model.take_play_request(&resumed));
+    EXPECT_EQ(resumed.series_id, "20");
+    model.parental_action(ptv::Model::ParentalAction::set_pin);
+    model.poll();
+    host::set_keyboard_text("123456");
+    model.poll();
+    host::set_keyboard_text("123456");
+    model.poll();
+    EXPECT_TRUE(model.home_items()[0].empty());
+    EXPECT_FALSE(model.play_home(id, true));
+    model.close();
+}
+
+TEST_F(VodTest, ColdHomeEpisodeAutoplayUsesIndependentSavedSeries)
+{
+    std::string id;
+    {
+        ptv::Model model(dir);
+        ASSERT_TRUE(model.open());
+        model.view.vod_series_group = "Comedy";
+        model.vod().select(ptv::VodKind::episodes, "20");
+        ASSERT_TRUE(settle(model));
+        ASSERT_TRUE(model.play_vod(2)); // Season 2, episode 2.
+        ptv::PlayRequest request;
+        ASSERT_TRUE(model.take_play_request(&request));
+        id = request.channel_id;
+        model.finish_vod(request, 12000000, 100000000, false);
+        model.vod().select(ptv::VodKind::movies);
+        ASSERT_TRUE(settle(model));
+        model.close();
+    }
+    host::set_network(false, "");
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    model.vod().select(ptv::VodKind::movies);
+    ASSERT_EQ(model.vod().catalog().size(), 2u);
+    ASSERT_TRUE(model.play_home(id, true));
+    ptv::PlayRequest request;
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_EQ(request.start_position_us, 12000000u);
+    EXPECT_EQ(model.vod().catalog()[0].name, "Alpha movie");
+    model.close(); // Foreground playback closes the menu workers.
+    ASSERT_TRUE(model.finish_vod(request, 100000000, 100000000, true));
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_NE(request.channel_id, id);
+    EXPECT_EQ(request.series_id, "20");
+    EXPECT_EQ(request.start_position_us, 0u);
+    ASSERT_TRUE(model.hide_category("Comedy", true));
+    EXPECT_FALSE(model.finish_vod(request, 100000000, 100000000, true));
+    ASSERT_TRUE(model.hide_category("Comedy", false));
+    auto stale = request;
+    stale.source_id++;
+    EXPECT_FALSE(model.finish_vod(stale, 100000000, 100000000, true));
+    ASSERT_TRUE(model.finish_vod(request, 100000000, 100000000, true));
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_FALSE(model.finish_vod(request, 100000000, 100000000, true));
+    EXPECT_EQ(model.vod().catalog()[0].name, "Alpha movie");
+}
+
+TEST_F(VodTest, MissingHomeSeriesFetchCanCancelAndFallsBackToSavedEpisode)
+{
+    std::string id;
+    {
+        ptv::Model model(dir);
+        ASSERT_TRUE(model.open());
+        model.vod().select(ptv::VodKind::episodes, "20");
+        ASSERT_TRUE(settle(model));
+        ASSERT_TRUE(model.play_vod(2)); // Season 2, episode 2.
+        ptv::PlayRequest request;
+        ASSERT_TRUE(model.take_play_request(&request));
+        id = request.channel_id;
+        model.finish_vod(request, 12000000, 100000000, false);
+        model.close();
+    }
+    const auto series_cache = dir + "/prosperotv-xtream-catalog.sqlite3.vod-2-" +
+                              std::to_string(iptv::CustomSourceId("20")) + ".sqlite3";
+    ASSERT_TRUE(std::filesystem::remove(series_cache));
+    host::set_network(true, "", 15000);
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    ASSERT_TRUE(model.play_home(id, true));
+    ptv::PlayRequest request;
+    model.poll(); // Cancellation must also stop an active worker.
+    EXPECT_FALSE(model.take_play_request(&request));
+    std::string phone_response;
+    EXPECT_EQ(model.remote_browse(R"({"operation":"list"})", phone_response), 409);
+    EXPECT_NE(phone_response.find("episode loading"), phone_response.npos);
+    ASSERT_TRUE(model.cancel_home_play());
+    model.poll();
+    EXPECT_FALSE(model.take_play_request(&request));
+    ASSERT_TRUE(model.play_home(id, true));
+    model.poll();
+    model.use_saved_source(1);
+    EXPECT_FALSE(model.take_play_request(&request));
+    model.close();
+    model.use_saved_source(3);
+    ASSERT_TRUE(model.play_home(id, true));
+    const auto started = std::chrono::steady_clock::now();
+    bool ready = false;
+    for (int i = 0; i < 2500 && !ready; ++i)
+    {
+        model.poll();
+        ready = model.take_play_request(&request);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(ready);
+    EXPECT_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(12));
+    EXPECT_EQ(request.channel_id, id);
+    EXPECT_FALSE(model.finish_vod(request, 100000000, 100000000, true));
+    EXPECT_TRUE(model.vod().catalog().empty());
+    model.save_vod_progress(id, 12000000, 100000000);
+    host::set_network(true, "");
+    ASSERT_TRUE(model.play_home(id, true));
+    ready = false;
+    for (int i = 0; i < 500 && !ready; ++i)
+    {
+        model.poll();
+        ready = model.take_play_request(&request);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_TRUE(ready);
+    model.close();
+    EXPECT_TRUE(model.finish_vod(request, 100000000, 100000000, true));
+    EXPECT_TRUE(model.take_play_request(&request));
+    EXPECT_NE(request.channel_id, id);
+}
+
+TEST_F(VodTest, HomeSnapshotBoundAndSourceFingerprintSurviveRestart)
+{
+    ptv::Library library;
+    ASSERT_TRUE(library.open(dir + "/prosperotv-library.sqlite3"));
+    for (int i = 0; i < 55; ++i)
+    {
+        iptv::Channel item;
+        item.id = "movie-" + std::to_string(i);
+        item.name = item.id;
+        item.url = "https://stream.invalid/movie.mkv";
+        item.group_title = "General";
+        item.alternate_group_titles = {"Restricted", "US"};
+        item.http_user_agent = "Test player";
+        item.alternate_urls = {"https://backup.invalid/movie.mkv"};
+        ASSERT_TRUE(library.remember_vod(3, 42, item, "series-1", 1000 + i));
+        ASSERT_TRUE(library.save_playback_progress(item.id, 10, 100));
+    }
+    ASSERT_TRUE(library.close());
+    ASSERT_TRUE(library.open(dir + "/prosperotv-library.sqlite3"));
+    auto rows = library.unfinished_vod(3, 42);
+    ASSERT_EQ(rows.size(), 50u);
+    EXPECT_EQ(rows.front().channel.id, "movie-54");
+    EXPECT_EQ(rows.back().channel.id, "movie-5");
+    EXPECT_EQ(rows.front().channel.alternate_group_titles[0], "Restricted");
+    EXPECT_EQ(rows.front().channel.http_user_agent, "Test player");
+    EXPECT_EQ(rows.front().channel.alternate_urls.size(), 1u);
+    EXPECT_EQ(rows.front().series, "series-1");
+    EXPECT_TRUE(library.unfinished_vod(3, 43).empty());
+    EXPECT_TRUE(library.unfinished_vod(2, 42).empty());
+    iptv::Channel bad = rows.front().channel;
+    EXPECT_FALSE(library.remember_vod(3, 42, bad, "group\nshow\nextra", 2000));
+    EXPECT_FALSE(library.remember_vod(3, 42, bad, "group\nshow\r", 2000));
+    EXPECT_FALSE(library.remember_vod(3, 42, bad, "group\n" + std::string(2049, 'x'), 2000));
+    bad.url = "file:///secret";
+    EXPECT_FALSE(library.remember_vod(3, 42, bad, "", 2000));
+    ASSERT_TRUE(library.save_playback_progress("movie-54", 0, 100));
+    EXPECT_EQ(library.unfinished_vod(3, 42).size(), 49u);
+    auto source = library.sources().front();
+    ASSERT_EQ(source.id, 3);
+    source.password = "changed";
+    ASSERT_TRUE(library.save_source(&source));
+    EXPECT_TRUE(library.unfinished_vod(3, 42).empty());
+    library.close();
+}
+
 TEST_F(VodTest, UnifiedSearchLoadsBothKindsWithoutChangingBrowseAndRoutesSafely)
 {
     ptv::Model model(dir);
@@ -129,6 +385,38 @@ TEST_F(VodTest, UnifiedSearchLoadsBothKindsWithoutChangingBrowseAndRoutesSafely)
     model.end_search();
     EXPECT_TRUE(model.search_results("show").empty());
     EXPECT_FALSE(model.activate_search_vod(shows[0]));
+    model.close();
+}
+
+TEST_F(VodTest, OpenSearchFollowsInitialAndReplacementPlaylistDownloads)
+{
+    const std::string url = "https://provider.invalid/list.m3u";
+    {
+        ptv::Library library;
+        ASSERT_TRUE(library.open(dir + "/prosperotv-library.sqlite3"));
+        ptv::SavedSource source{2, 1, "Playlist", url, {}, {}, {}, ptv::RefreshSchedule::manual};
+        ASSERT_TRUE(library.save_source(&source));
+        ASSERT_TRUE(library.select_source(2));
+    }
+    reply(url, "#EXTM3U\n#EXTINF:120,First film\nhttps://stream.invalid/movie/first.mp4\n");
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    model.begin_search(); // The playlist has not reached the UI thread yet.
+    ASSERT_TRUE(settle(model));
+    auto results = model.search_results("film");
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_EQ(results[0].title, "First film");
+    reply(url, "#EXTM3U\n#EXTINF:120,Replacement film\nhttps://stream.invalid/movie/second.mp4\n");
+    model.refresh();
+    model.begin_search(); // Reopen the sheet while the replacement is downloading.
+    ASSERT_TRUE(settle(model));
+    results = model.search_results("film");
+    ASSERT_EQ(results.size(), 1u);
+    EXPECT_EQ(results[0].title, "Replacement film");
+    ASSERT_TRUE(model.activate_search_vod(results[0]));
+    ptv::PlayRequest request;
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_EQ(request.urls[0], "https://stream.invalid/movie/second.mp4");
     model.close();
 }
 
@@ -437,7 +725,8 @@ TEST_F(VodTest, FilmControlsClampSkipsPauseAndSelectChapters)
     EXPECT_EQ(controls.input(IPTV_INPUT_PLAY_PAUSE, 5), 1);
     EXPECT_EQ(controls.take_media_pause(), true);
     EXPECT_EQ(controls.input(IPTV_INPUT_OPTIONS, 6), 1);
-    EXPECT_EQ(controls.input(IPTV_INPUT_L1, 7), 1); // Chapters, last tab.
+    EXPECT_EQ(controls.input(IPTV_INPUT_L1, 7), 1); // Quality, last tab.
+    EXPECT_EQ(controls.input(IPTV_INPUT_L1, 7), 1); // Chapters.
     EXPECT_EQ(controls.input(IPTV_INPUT_DOWN, 8), 1);
     EXPECT_EQ(controls.input(IPTV_INPUT_CROSS, 9), 1);
     EXPECT_EQ(controls.take_media_seek(), 50000000u);
@@ -490,14 +779,14 @@ TEST_F(VodTest, EmptyListsAreValidAndCancellationStopsTheWorker)
     model.vod().select(ptv::VodKind::movies);
     ASSERT_TRUE(settle(model));
     EXPECT_TRUE(model.vod().loaded());
-    EXPECT_TRUE(model.vod().catalog().empty());
+    EXPECT_EQ(model.vod().catalog().size(), 0u);
     std::string series;
     ASSERT_TRUE(iptv::BuildXtreamSeriesUrl(account, "20", &series));
     reply(series, "{\"episodes\":[]}");
     model.vod().select(ptv::VodKind::episodes, "20");
     ASSERT_TRUE(settle(model));
     EXPECT_TRUE(model.vod().loaded());
-    EXPECT_TRUE(model.vod().catalog().empty());
+    EXPECT_EQ(model.vod().catalog().size(), 0u);
     host::set_network(true, "", 5000);
     model.vod().select(ptv::VodKind::movies, {}, true);
     model.poll();
@@ -510,3 +799,483 @@ TEST_F(VodTest, EmptyListsAreValidAndCancellationStopsTheWorker)
     model.close();
 }
 } // namespace
+
+TEST_F(VodTest, ProviderMetadataSurvivesCacheAndSeriesInfoInheritsIntoEpisodes)
+{
+    response(
+        "get_vod_streams",
+        R"([{"stream_id":10,"name":"Alpha","genre":"Drama / Mystery","releaseDate":"2024-03-09","rating":"8.2","rating_5based":1,"plot":"Provider synopsis","cast":["One","Two"]}])");
+    iptv::Catalog catalog;
+    ptv::VodMetadata metadata;
+    std::string error;
+    ASSERT_TRUE(
+        ptv::load_vod(account, ptv::VodKind::movies, {}, &catalog, nullptr, &error, &metadata));
+    ASSERT_EQ(catalog.size(), 1u);
+    const auto id = std::string(catalog[0].id);
+    ASSERT_EQ(metadata.at(id).year, "2024");
+    EXPECT_EQ(catalog[0].media_kind, iptv::MediaKind::movie);
+    EXPECT_EQ(metadata.at(id).cast, "One, Two");
+    EXPECT_EQ(ptv::vod_genres(metadata.at(id).genre).size(), 2u);
+    ASSERT_EQ(iptv::SaveCatalog(dir + "/details.sqlite3", catalog), iptv::StoreStatus::ok);
+    ASSERT_TRUE(ptv::save_vod_metadata(dir + "/details.sqlite3", metadata));
+    const auto cached = ptv::load_vod_metadata(dir + "/details.sqlite3", catalog);
+    EXPECT_EQ(cached.at(id).plot, "Provider synopsis");
+    EXPECT_EQ(cached.at(id).rating, "8.2");
+    std::string url;
+    ASSERT_TRUE(iptv::BuildXtreamSeriesUrl(account, "20", &url));
+    reply(
+        url,
+        R"({"episodes":{"1":[{"id":200,"title":"Pilot","info":{"plot":"Episode synopsis"}},{"id":201,"title":"Return","info":null}]},"info":{"plot":"Show synopsis","cast":"Actor","genre":"Comedy","rating_5based":4.5,"releaseDate":"2022-01-01","cover":"https://image.invalid/show.png"}})");
+    ASSERT_TRUE(
+        ptv::load_vod(account, ptv::VodKind::episodes, "20", &catalog, nullptr, &error, &metadata));
+    ASSERT_EQ(catalog.size(), 2u);
+    EXPECT_EQ(metadata.at(std::string(catalog[0].id)).plot, "Episode synopsis");
+    EXPECT_EQ(metadata.at(std::string(catalog[1].id)).plot, "Show synopsis");
+    EXPECT_EQ(metadata.at(std::string(catalog[1].id)).year, "2022");
+    EXPECT_EQ(metadata.at(std::string(catalog[1].id)).rating, "9");
+    EXPECT_EQ(catalog[1].media_kind, iptv::MediaKind::episode);
+    EXPECT_EQ(metadata.at(std::string(catalog[1].id)).poster, "https://image.invalid/show.png");
+}
+TEST_F(VodTest, MovieDetailsFetchLazilyAndRemainAvailableOfflineAfterRefresh)
+{
+    std::string info;
+    ASSERT_TRUE(iptv::BuildXtreamApiUrl(account, "get_vod_info", &info));
+    reply(
+        info + "&vod_id=10",
+        R"({"info":{"plot":"Full plot","cast":"Actor A","genre":"Drama","releasedate":"2023-05-02","rating":7.5,"movie_image":"https://image.invalid/poster.jpg"},"movie_data":{"stream_id":10}})");
+    std::string id;
+    {
+        ptv::Model model(dir);
+        ASSERT_TRUE(model.open());
+        model.vod().select(ptv::VodKind::movies);
+        ASSERT_TRUE(settle(model));
+        id = model.vod().catalog()[0].id;
+        EXPECT_FALSE(model.vod().details(id).complete);
+        model.vod().request_details(0);
+        ASSERT_TRUE(settle(model));
+        EXPECT_TRUE(model.vod().details(id).complete);
+        EXPECT_EQ(model.vod().details(id).plot, "Full plot");
+        model.vod().select(ptv::VodKind::movies, {}, true);
+        ASSERT_TRUE(settle(model));
+        EXPECT_EQ(model.vod().details(id).plot, "Full plot");
+        model.close();
+    }
+    host::set_network(false, "");
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    model.vod().select(ptv::VodKind::movies);
+    ASSERT_TRUE(settle(model));
+    EXPECT_EQ(model.vod().details(id).genre, "Drama");
+    EXPECT_EQ(model.vod().details(id).year, "2023");
+    EXPECT_EQ(model.vod().details(id).poster, "https://image.invalid/poster.jpg");
+    model.close();
+}
+TEST_F(VodTest, ControllerFiltersByProviderGenreAndYearSortsAndOpensDetails)
+{
+    response(
+        "get_vod_streams",
+        R"([{"stream_id":10,"name":"Alpha","genre":"Drama","year":"2020","rating":"5"},{"stream_id":11,"name":"Beta","genre":"Comedy","year":"2024","rating":"9"}])");
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    model.view.vod_kind = static_cast<int>(ptv::VodKind::movies);
+    model.view.vod_all = true;
+    hui::gfx::Font font;
+    std::ifstream font_file(std::string(std::getenv("KIT_FONTS")) + "/inter-regular.huifont",
+                            std::ios::binary);
+    const std::string font_bytes{std::istreambuf_iterator<char>(font_file), {}};
+    ASSERT_TRUE(font.load(font_bytes));
+    hui::ui::Fonts fonts{};
+    fonts.regular.font = &font;
+    fonts.regular.texture = 1;
+    fonts.semibold = fonts.display = fonts.mono = fonts.hand = fonts.pixel = fonts.regular;
+    ptv::Shared shared(model, fonts, {});
+    ptv::VodScreen screen(shared);
+    hui::ui::Feedback feedback;
+    const auto press = [&](hui::Action action)
+    {
+        hui::InputFrame input;
+        input.pressed = hui::action_bit(action);
+        screen.handle(input, feedback);
+    };
+    const auto move = [&](hui::Direction direction)
+    {
+        hui::InputFrame input;
+        input.nav = direction;
+        screen.handle(input, feedback);
+    };
+    screen.enter();
+    ASSERT_TRUE(settle(model));
+    screen.update();
+    ASSERT_EQ(screen.result_count(), 2u);
+    press(hui::Action::r3);
+    ASSERT_TRUE(screen.filters_open());
+    hui::gfx::DrawList list;
+    hui::ui::Canvas canvas{list, fonts, 0, 0};
+    screen.draw(canvas);
+    EXPECT_FALSE(list.empty());
+    move(hui::Direction::right);
+    EXPECT_EQ(model.view.vod_genre, "Comedy");
+    EXPECT_EQ(screen.result_count(), 1u);
+    press(hui::Action::west);
+    move(hui::Direction::down);
+    move(hui::Direction::right);
+    EXPECT_EQ(model.view.vod_year, "2020");
+    EXPECT_EQ(screen.result_count(), 1u);
+    press(hui::Action::west);
+    move(hui::Direction::down);
+    move(hui::Direction::right);
+    move(hui::Direction::right);
+    EXPECT_EQ(model.view.vod_sort, 2);
+    press(hui::Action::confirm);
+    press(hui::Action::west);
+    EXPECT_TRUE(screen.details_open());
+    screen.draw(canvas);
+    ASSERT_TRUE(screen.back());
+    EXPECT_FALSE(screen.details_open());
+    press(hui::Action::confirm);
+    ptv::PlayRequest request;
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_EQ(request.channel_name, "Beta");
+    model.close();
+}
+
+TEST_F(VodTest, MalformedMovieDetailsKeepPreviousMetadataAndDoNotComplete)
+{
+    std::string info;
+    ASSERT_TRUE(iptv::BuildXtreamApiUrl(account, "get_vod_info", &info));
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    model.vod().select(ptv::VodKind::movies);
+    ASSERT_TRUE(settle(model));
+    const std::string id(model.vod().catalog()[0].id);
+    std::string deep;
+    for (int i = 0; i < 2000; ++i)
+        deep += "{\"info\":";
+    deep += "{\"plot\":\"Too deep\"}";
+    deep += std::string(2000, '}');
+    const std::string oversized = "{\"info\":{\"cast\":[\"" + std::string(257, 'x') +
+                                  "\",\"Other actor\"],\"plot\":\"Invalid\"}}";
+    for (const auto &payload :
+         {deep, oversized, std::string(R"({"info":{"cast":["bad\q"],"plot":"Invalid"}})")})
+    {
+        reply(info + "&vod_id=10", payload);
+        model.vod().request_details(0);
+        ASSERT_TRUE(settle(model));
+        EXPECT_FALSE(model.vod().details(id).complete);
+        EXPECT_TRUE(model.vod().details(id).plot.empty());
+        EXPECT_TRUE(model.vod().details(id).cast.empty());
+    }
+    reply(info + "&vod_id=10", R"({"info":{"cast":[{},["ignored"],"Good actor"],"plot":"Good"}})");
+    model.vod().request_details(0);
+    ASSERT_TRUE(settle(model));
+    EXPECT_TRUE(model.vod().details(id).complete);
+    EXPECT_EQ(model.vod().details(id).cast, "Good actor");
+    model.close();
+}
+
+TEST_F(VodTest, AccountInfoComesFromNormalRefreshAndSurvivesOfflineCachedStartup)
+{
+    const auto expiry = std::time(nullptr) + 3 * 86400;
+    response("", std::string(R"({"user_info":{"auth":1,"exp_date":)") + std::to_string(expiry) +
+                     R"(,"max_connections":"4"}})");
+    response("get_live_categories", R"([])");
+    response("get_live_streams", R"([{"stream_id":1,"name":"Live"}])");
+    {
+        ptv::Model model(dir);
+        ASSERT_TRUE(model.open());
+        model.refresh();
+        ASSERT_TRUE(settle(model));
+        ASSERT_NE(model.saved_source(3), nullptr);
+        EXPECT_EQ(model.saved_source(3)->account.expires_unix, expiry);
+        EXPECT_EQ(model.saved_source(3)->account.max_connections, 4);
+        std::string auth_url;
+        ASSERT_TRUE(iptv::BuildXtreamApiUrl(account, "", &auth_url));
+        const auto requests = host::requests();
+        EXPECT_EQ(std::count_if(requests.begin(), requests.end(),
+                                [&](const auto &request) { return request.url == auth_url; }),
+                  1);
+        const auto notices = model.take_notices();
+        EXPECT_TRUE(std::any_of(notices.begin(), notices.end(), [](const auto &notice)
+                                { return notice.title == "Account expires within a week"; }));
+        const auto checked = model.saved_source(3)->account.checked_unix;
+        host::set_unix_time(static_cast<std::uint64_t>(checked + 60));
+        response("", R"({"user_info":{"auth":0}})");
+        model.refresh();
+        ASSERT_TRUE(settle(model));
+        EXPECT_EQ(model.saved_source(3)->account.checked_unix, checked);
+        host::set_unix_time(0);
+        model.close();
+    }
+    host::set_network(false, "");
+    const auto downloads = host::fetch_count();
+    ptv::Model offline(dir);
+    ASSERT_TRUE(offline.open());
+    EXPECT_FALSE(offline.refreshing());
+    EXPECT_EQ(offline.saved_source(3)->account.expires_unix, expiry);
+    EXPECT_EQ(offline.saved_source(3)->account.max_connections, 4);
+    EXPECT_EQ(host::fetch_count(), downloads);
+    const auto notices = offline.take_notices();
+    EXPECT_TRUE(std::any_of(notices.begin(), notices.end(), [](const auto &notice)
+                            { return notice.title == "Account expires within a week"; }));
+    offline.close();
+}
+
+TEST_F(VodTest, SourceHttpDefaultsReachAccountCatalogGuideAndVodRequestsAndPlayback)
+{
+    {
+        ptv::Library library;
+        ASSERT_TRUE(library.open(dir + "/prosperotv-library.sqlite3"));
+        auto source = library.sources()[0];
+        source.user_agent = "AccountPlayer/2";
+        source.extra_headers = "X-Key: account-secret";
+        source.referrer = "https://provider.invalid/watch";
+        ASSERT_TRUE(library.save_source(&source));
+    }
+    response("", R"({"user_info":{"auth":1}})");
+    response("get_live_categories", R"([])");
+    response("get_live_streams", R"([{"stream_id":1,"name":"Live"}])");
+    std::string details_url;
+    ASSERT_TRUE(iptv::BuildXtreamApiUrl(account, "get_vod_info", &details_url));
+    reply(details_url + "&vod_id=10", R"({"info":{"plot":"Protected details"}})");
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    model.refresh();
+    ASSERT_TRUE(settle(model));
+    ASSERT_TRUE(model.play(0));
+    ptv::PlayRequest request;
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_EQ(request.extra_headers, "X-Key: account-secret");
+    EXPECT_EQ(request.user_agent, "AccountPlayer/2");
+    EXPECT_EQ(request.referrer, "https://provider.invalid/watch");
+    ASSERT_TRUE(model.set_schedule(model.selected_source_id(), ptv::RefreshSchedule::manual));
+    model.vod().select(ptv::VodKind::movies);
+    ASSERT_TRUE(settle(model));
+    model.vod().request_details(0);
+    ASSERT_TRUE(settle(model));
+    EXPECT_EQ(model.vod().details(model.vod().catalog()[0].id).plot, "Protected details");
+    ASSERT_TRUE(model.play_vod(0));
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_EQ(request.extra_headers, "X-Key: account-secret");
+    EXPECT_EQ(request.user_agent, "AccountPlayer/2");
+    EXPECT_EQ(request.referrer, "https://provider.invalid/watch");
+    model.vod().select(ptv::VodKind::episodes, "20");
+    ASSERT_TRUE(settle(model));
+    model.close();
+    auto requests = host::requests();
+    ASSERT_GE(requests.size(), 7u);
+    bool guide = false, series = false, details = false;
+    for (const auto &fetched : requests)
+    {
+        EXPECT_EQ(fetched.extra_headers, "X-Key: account-secret");
+        EXPECT_EQ(fetched.user_agent, "AccountPlayer/2") << fetched.url;
+        EXPECT_EQ(fetched.referrer, "https://provider.invalid/watch") << fetched.url;
+        guide = guide || fetched.url.find("xmltv.php") != std::string::npos;
+        series = series || fetched.url.find("get_series_info") != std::string::npos;
+        details = details || fetched.url.find("get_vod_info") != std::string::npos;
+    }
+    EXPECT_TRUE(guide);
+    EXPECT_TRUE(series);
+    EXPECT_TRUE(details);
+}
+
+TEST_F(VodTest, HomeUsesFreshEpisodeUrlAndCurrentSourceHeadersAfterColdFetch)
+{
+    std::string id;
+    {
+        ptv::Model model(dir);
+        ASSERT_TRUE(model.open());
+        model.view.vod_series_group = "Comedy";
+        model.vod().select(ptv::VodKind::episodes, "20");
+        ASSERT_TRUE(settle(model));
+        ASSERT_TRUE(model.play_vod(2));
+        ptv::PlayRequest request;
+        ASSERT_TRUE(model.take_play_request(&request));
+        ASSERT_TRUE(request.urls[0].ends_with("202.mp4"));
+        id = request.channel_id;
+        model.finish_vod(request, 12000000, 100000000, false);
+        model.close();
+    }
+    ASSERT_TRUE(std::filesystem::remove(dir + "/prosperotv-xtream-catalog.sqlite3.vod-2-" +
+                                        std::to_string(iptv::CustomSourceId("20")) + ".sqlite3"));
+    std::string series;
+    ASSERT_TRUE(iptv::BuildXtreamSeriesUrl(account, "20", &series));
+    reply(
+        series,
+        R"({"episodes":{"2":[{"id":202,"title":"Earlier","episode_num":2,"container_extension":"mkv"}]}})");
+    {
+        ptv::Library library;
+        ASSERT_TRUE(library.open(dir + "/prosperotv-library.sqlite3"));
+        const auto sources = library.sources();
+        auto source =
+            *std::find_if(sources.begin(), sources.end(), [](const auto &s) { return s.id == 3; });
+        source.user_agent = "CurrentAgent";
+        source.extra_headers = "X-Key: current";
+        ASSERT_TRUE(library.save_source(&source));
+    }
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    ASSERT_TRUE(model.play_home(id, true));
+    ptv::PlayRequest resumed;
+    bool ready = false;
+    for (int i = 0; i < 500 && !ready; ++i)
+    {
+        model.poll();
+        ready = model.take_play_request(&resumed);
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_TRUE(ready);
+    if (ready)
+    {
+        EXPECT_TRUE(resumed.urls[0].ends_with("202.mkv"));
+        EXPECT_EQ(resumed.user_agent, "CurrentAgent");
+        EXPECT_EQ(resumed.extra_headers, "X-Key: current");
+        EXPECT_EQ(resumed.start_position_us, 12000000u);
+    }
+    ASSERT_TRUE(model.hide_category("Comedy", true));
+    EXPECT_FALSE(model.play_home(id, true));
+    model.close();
+}
+
+TEST_F(VodTest, HomeMovieUsesMatchingLoadedUrlWithoutAnotherDownload)
+{
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    model.vod().select(ptv::VodKind::movies);
+    ASSERT_TRUE(settle(model));
+    ASSERT_TRUE(model.play_vod(0));
+    ptv::PlayRequest request;
+    ASSERT_TRUE(model.take_play_request(&request));
+    const auto id = request.channel_id;
+    ASSERT_TRUE(request.urls[0].ends_with("10.mkv"));
+    model.finish_vod(request, 12000000, 100000000, false);
+    response(
+        "get_vod_streams",
+        R"([{"stream_id":10,"name":"Alpha movie","container_extension":"mp4","category_id":3}])");
+    model.vod().select(ptv::VodKind::movies, {}, true);
+    ASSERT_TRUE(settle(model));
+    const auto downloads = host::fetch_count();
+    ASSERT_TRUE(model.play_home(id, true));
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_TRUE(request.urls[0].ends_with("10.mp4"));
+    EXPECT_EQ(request.start_position_us, 12000000u);
+    EXPECT_EQ(host::fetch_count(), downloads);
+    model.close();
+}
+
+TEST_F(VodTest, HomeInheritsNewLoadedParentPolicyAndKeepsItOffline)
+{
+    std::string id;
+    {
+        ptv::Model model(dir);
+        ASSERT_TRUE(model.open());
+        model.view.vod_series_group = "Comedy";
+        model.vod().select(ptv::VodKind::episodes, "20");
+        ASSERT_TRUE(settle(model));
+        ASSERT_TRUE(model.play_vod(2));
+        ptv::PlayRequest request;
+        ASSERT_TRUE(model.take_play_request(&request));
+        id = request.channel_id;
+        model.finish_vod(request, 12000000, 100000000, false);
+        response("get_series_categories", R"([{"category_id":8,"category_name":"Restricted"}])");
+        response("get_series",
+                 R"([{"series_id":20,"name":"A show","category_id":8,"is_adult":1}])");
+        model.vod().select(ptv::VodKind::series);
+        ASSERT_TRUE(settle(model));
+        ASSERT_TRUE(model.hide_category("Restricted", true));
+        EXPECT_FALSE(model.play_home(id, true));
+        ASSERT_TRUE(model.hide_category("Restricted", false));
+        model.parental_action(ptv::Model::ParentalAction::set_pin);
+        model.poll();
+        host::set_keyboard_text("123456");
+        model.poll();
+        host::set_keyboard_text("123456");
+        model.poll();
+        EXPECT_FALSE(model.play_home(id, true));
+        model.parental_action(ptv::Model::ParentalAction::unlock);
+        model.poll();
+        host::set_keyboard_text("123456");
+        model.poll();
+        ASSERT_TRUE(model.play_home(id, true));
+        ASSERT_TRUE(model.take_play_request(&request));
+        model.finish_vod(request, 12000000, 100000000, false);
+        model.close();
+    }
+    host::set_network(false, "");
+    ptv::Model offline(dir);
+    ASSERT_TRUE(offline.open());
+    EXPECT_TRUE(offline.vod().catalog().empty());
+    EXPECT_TRUE(offline.home_items()[0].empty());
+    EXPECT_FALSE(offline.play_home(id, true));
+    offline.close();
+}
+
+TEST_F(VodTest, HomeParentPolicyWithLargeLoadedShowCatalog)
+{
+    constexpr unsigned count = 100000;
+    host::set_network_piece(65536);
+    std::string shows = "[";
+    for (unsigned i = 0; i < count; ++i)
+        shows += (i ? "," : "") + std::string(R"({"series_id":)") + std::to_string(i) +
+                 R"(,"name":"Show","category_id":4})";
+    shows += "]";
+    response("get_series", shows);
+    {
+        ptv::Library library;
+        ASSERT_TRUE(library.open(dir + "/prosperotv-library.sqlite3"));
+        for (unsigned i = 0; i < 50; ++i)
+        {
+            iptv::Channel item;
+            item.id = "resume-" + std::to_string(i);
+            item.name = "Saved episode";
+            item.url = "https://provider.invalid/episode.mp4";
+            item.source_id = iptv::XtreamSourceId(account);
+            item.media_kind = iptv::MediaKind::episode;
+            ASSERT_TRUE(
+                library.remember_vod(3, item.source_id, item, std::to_string(count - 1 - i), 1));
+            ASSERT_TRUE(library.save_playback_progress(item.id, 10000000, 100000000));
+        }
+    }
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    model.vod().select(ptv::VodKind::series);
+    for (unsigned i = 0; i < 5000 && (model.vod().requested() || model.vod().busy()); ++i)
+    {
+        model.poll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    EXPECT_EQ(model.vod().catalog().size(), count);
+    EXPECT_EQ(model.vod().find_series("99999", iptv::XtreamSourceId(account) + 1),
+              iptv::Catalog::npos);
+    EXPECT_EQ(model.vod().find_series("missing", iptv::XtreamSourceId(account)),
+              iptv::Catalog::npos);
+    std::vector<long long> elapsed;
+    for (unsigned trial = 0; trial < 5; ++trial)
+    {
+        const auto began = std::chrono::steady_clock::now();
+        const auto home = model.home_items();
+        elapsed.push_back(std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - began)
+                              .count());
+        EXPECT_EQ(home[0].size(), 50u);
+    }
+    std::sort(elapsed.begin(), elapsed.end());
+    std::printf("Home 100000 shows / 50 resumes median=%lld us min=%lld us max=%lld us\n",
+                elapsed[2], elapsed.front(), elapsed.back());
+    EXPECT_TRUE(model.hide_category("Comedy", true));
+    EXPECT_TRUE(model.home_items()[0].empty());
+    model.close();
+}
+
+TEST(VodLibrary, PlaylistParentLookupUsesExactGroupingKeyAndSource)
+{
+    auto catalog = iptv::ParseExtendedM3u(
+        "#EXTM3U\n#EXTINF:-1 group-title=\"Kids\",Show S01E01\nhttps://host/series/1.mp4\n", 123);
+    ASSERT_EQ(catalog.size(), 1u);
+    ptv::VodLibrary vod;
+    vod.configure_playlist(&catalog);
+    vod.select(ptv::VodKind::series);
+    ASSERT_EQ(vod.catalog().size(), 1u);
+    EXPECT_EQ(vod.find_series("Kids\nShow", 123), 0u);
+    EXPECT_EQ(vod.find_series("Kids\nShow", 124), iptv::Catalog::npos);
+    EXPECT_EQ(vod.find_series("Show", 123), iptv::Catalog::npos);
+}

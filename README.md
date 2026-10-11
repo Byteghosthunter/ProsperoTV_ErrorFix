@@ -84,6 +84,13 @@
   its subcategories.
 - Add and edit playlists and accounts from a phone or a computer with the
   [phone remote](#phone-remote), instead of the on-screen keyboard.
+- In Sources, R2 opens per-source HTTP settings: user agent, referrer and custom
+  request headers. Enter one `Name: value` at a time on TV (empty saves, `-`
+  clears all), or paste up to 16 lines / 4 KiB in the paired phone editor.
+  Saved custom values stay hidden on the phone; a blank field keeps them.
+  Channel user agents/referrers and built-in authentication take precedence.
+  Custom headers stay on the source's HTTP origin and are removed on redirects
+  to another origin. USB playlists use each initial stream URL as their origin.
 
 ### Browsing
 
@@ -114,8 +121,8 @@
 
 ### Movies and series
 
-- Browse an Xtream account's movies, shows, seasons, and episodes in
-  **On demand**.
+- Browse movies, shows, seasons, and episodes from an Xtream account or a
+  classified M3U playlist in **On demand**, next to Live TV.
 - Play H.264 and HEVC in MP4 or Matroska, up to 4K.
 
 ### While watching
@@ -209,7 +216,7 @@ at 3840×2160. Codec and renderer details are documented in
 | Circle | Back, dismiss, or clear active filters |
 | Square | Add or remove a favorite |
 | Triangle | Open advanced search and filters |
-| L1 / R1 | Switch between Live TV, Favorites, Sources, On demand, Settings, and About |
+| L1 / R1 | Switch between Home, Live TV, On demand, Favorites, Sources, Settings, and About |
 | L2 / R2 | Previous or next page; hold to keep turning |
 | Triangle on a configurable source | Edit the custom M3U URL or Xtream account |
 | Square in Sources | Cycle daily, weekly and manual refresh |
@@ -254,6 +261,12 @@ key). **Clear** removes the text query; existing category/country filters still
 apply. Search accepts up to 39 Unicode characters and is available in the
 channel browser. It also works while the TV's native search keyboard is open.
 The **Search & filters on TV** button opens the existing advanced search panel.
+
+Open **Channels and guide** to browse the active source on the phone, search
+channel names or programmes on now, and read upcoming programmes. Tap a channel
+to watch it, including while another channel or movie is playing. Hidden and
+parentally restricted channels stay unavailable; changing sources on the TV
+requires reloading the phone's channel list.
 
 The **Volume** sliders in TV Settings and on the phone control the same saved
 ProsperoTV volume, including live playback and interface sounds. Zero mutes it;
@@ -545,3 +558,5 @@ retain the provider's artwork. These choices are saved for the next video.
 In multiview, Touchpad keeps the selected live channel playing in a corner while you browse lists or the programme guide. L3 in the live list closes picture in picture.
 
 Live TV also offers Recently added (first seen by this app) and Most watched (successful viewing sessions), with history saved separately for each profile and source.
+
+On Demand: Square opens provider title details; R3 filters loaded metadata by genre/year or changes sorting. Movie details are fetched when opened and retained in the local cache.

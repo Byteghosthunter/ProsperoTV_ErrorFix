@@ -1124,7 +1124,8 @@ TEST_F(ModelTest, PlaybackPictureModesDoNotSelectTracksOrChannels)
     ASSERT_TRUE(model.take_play_request(&request));
     ptv::PlaybackOsd controls(model, request);
     EXPECT_EQ(controls.input(IPTV_INPUT_OPTIONS, 1), 1);
-    EXPECT_EQ(controls.input(IPTV_INPUT_L1, 2), 1);
+    EXPECT_EQ(controls.input(IPTV_INPUT_R1, 2), 1);
+    EXPECT_EQ(controls.input(IPTV_INPUT_R1, 2), 1);
     for (unsigned mode = 0; mode < 7; ++mode)
     {
         EXPECT_EQ(controls.input(IPTV_INPUT_CROSS, 3), 1);
@@ -1225,4 +1226,192 @@ TEST(ChannelHistory, CountsOnlySessionsThatActuallyPresentedVideo)
     EXPECT_FALSE(ptv::completed_watch("presented_frames=0\n", 20, 1));
     EXPECT_FALSE(ptv::completed_watch("presented_frames=123garbage\n", 20, 1));
     EXPECT_FALSE(ptv::completed_watch("", 20, 1));
+}
+
+TEST_F(ModelTest, PhoneSourceHttpDefaultsApplyToPlaylistAndChannelOverridesWin)
+{
+    std::ofstream(playlist_)
+        << "#EXTM3U\n#EXTINF:-1,A\nhttps://stream.invalid/a.ts\n"
+           "#EXTINF:-1,B\n#EXTVLCOPT:http-user-agent=ChannelPlayer/3\n"
+           "#EXTVLCOPT:http-referrer=https://channel.invalid/watch\nhttps://stream.invalid/b.ts\n";
+    ptv::Model model(dir_);
+    load(model);
+    std::string output;
+    EXPECT_EQ(
+        model.remote_sources(
+            R"({"operation":"save","id":2,"kind":1,"name":"Headers","url":"https://source.invalid/list.m3u","username":"","mac":"","schedule":2,"userAgent":"SourcePlayer/1","referrer":"https://source.invalid/watch"})",
+            output),
+        200)
+        << output;
+    ASSERT_TRUE(settle(model));
+    ASSERT_TRUE(model.play(0));
+    ptv::PlayRequest request;
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_EQ(request.user_agent, "SourcePlayer/1");
+    EXPECT_EQ(request.referrer, "https://source.invalid/watch");
+    ASSERT_TRUE(model.play(1));
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_EQ(request.user_agent, "ChannelPlayer/3");
+    EXPECT_EQ(request.referrer, "https://channel.invalid/watch");
+    bool fetched_source = false;
+    for (const auto &fetched : host::requests())
+        if (fetched.url == "https://source.invalid/list.m3u")
+        {
+            fetched_source = true;
+            EXPECT_EQ(fetched.user_agent, "SourcePlayer/1");
+            EXPECT_EQ(fetched.referrer, "https://source.invalid/watch");
+        }
+    EXPECT_TRUE(fetched_source);
+    ASSERT_EQ(model.remote_sources("", output), 200);
+    EXPECT_NE(output.find("SourcePlayer/1"), std::string::npos);
+    EXPECT_NE(output.find("https://source.invalid/watch"), std::string::npos);
+    model.close();
+}
+
+TEST_F(ModelTest, SourceHttpControllerFormSavesBothFieldsTogether)
+{
+    ptv::Model model(dir_);
+    load(model);
+    model.edit_source_http(2);
+    model.poll();
+    EXPECT_EQ(host::keyboard_title(), "Source user agent (1 of 3)");
+    host::set_keyboard_text("RemotePlayer/2");
+    model.poll();
+    EXPECT_EQ(host::keyboard_title(), "Source referrer (2 of 3)");
+    host::set_keyboard_text("https://provider.invalid/watch");
+    model.poll();
+    EXPECT_EQ(host::keyboard_title(), "Custom HTTP header");
+    host::set_keyboard_text("X-Key: secret");
+    model.poll();
+    host::set_keyboard_text("x-key: replacement");
+    model.poll();
+    host::set_keyboard_text("Host: bad");
+    model.poll();
+    host::set_keyboard_text("X-Bad: one\r\nInjected: value");
+    model.poll();
+    host::set_keyboard_text("");
+    model.poll();
+    EXPECT_EQ(model.saved_source(2)->extra_headers, "x-key: replacement");
+    EXPECT_EQ(model.saved_source(2)->user_agent, "RemotePlayer/2");
+    EXPECT_EQ(model.saved_source(2)->referrer, "https://provider.invalid/watch");
+    model.close();
+}
+
+TEST_F(ModelTest, PhoneCustomHeadersPreserveSecretsAndRejectEscapedInjection)
+{
+    ptv::Model model(dir_);
+    load(model);
+    std::string output;
+    const std::string prefix =
+        R"({"operation":"save","id":2,"kind":1,"name":"Custom","url":"https://source.invalid/list.m3u","schedule":2)";
+    host::set_network_response("https://source.invalid/list.m3u", playlist_);
+    for (const auto *bad :
+         {R"(X-Key: a\r\nBad: b)", R"(X-Key: a\u0000b)", R"(X-Key: a\nBad)", "Host: bad"})
+    {
+        EXPECT_EQ(model.remote_sources(prefix + ",\"extraHeaders\":\"" + bad + "\"}", output), 400);
+        EXPECT_TRUE(model.saved_source(2)->extra_headers.empty());
+    }
+    ASSERT_EQ(
+        model.remote_sources(prefix + R"(,"extraHeaders":"X-Key: secret\nX-Device: tv"})", output),
+        200);
+    ASSERT_TRUE(settle(model));
+    EXPECT_EQ(model.saved_source(2)->extra_headers, "X-Key: secret\nX-Device: tv");
+    ASSERT_EQ(model.remote_sources("", output), 200);
+    EXPECT_EQ(output.find("secret"), std::string::npos);
+    EXPECT_NE(output.find("\"extraHeadersSet\":true"), std::string::npos);
+    ASSERT_TRUE(model.play(0));
+    ptv::PlayRequest request;
+    ASSERT_TRUE(model.take_play_request(&request));
+    EXPECT_EQ(request.extra_headers, "X-Key: secret\nX-Device: tv");
+    EXPECT_EQ(request.credential_origin, "https://source.invalid/list.m3u");
+    const auto preview = model.preview_request(request.channel_id);
+    ASSERT_TRUE(preview);
+    EXPECT_EQ(preview->extra_headers, request.extra_headers);
+    EXPECT_EQ(preview->credential_origin, request.credential_origin);
+    EXPECT_EQ(model.remote_sources(prefix + "}", output), 200);
+    ASSERT_TRUE(settle(model));
+    EXPECT_EQ(model.saved_source(2)->extra_headers, request.extra_headers);
+    EXPECT_EQ(model.remote_sources(prefix + R"(,"extraHeaders":""})", output), 200);
+    ASSERT_TRUE(settle(model));
+    EXPECT_TRUE(model.saved_source(2)->extra_headers.empty());
+    model.close();
+}
+
+TEST_F(ModelTest, QualityPickerReopensOnlyPlayableChoicesAndKeepsTracksAcrossIds)
+{
+    ptv::Model model(dir_);
+    load(model);
+    ptv::PlayRequest request;
+    request.live = false;
+    ptv::PlaybackOsd controls(model, request);
+    EXPECT_EQ(controls.input(IPTV_INPUT_OPTIONS, 1), 1);
+    EXPECT_EQ(controls.input(IPTV_INPUT_L1, 2), 1);
+    EXPECT_EQ(controls.input(IPTV_INPUT_CROSS, 3), 1);
+    EXPECT_FALSE(controls.quality_selection());
+    iptv_player_quality_state_t quality{};
+    quality.count = 1;
+    controls.set_quality_state(quality);
+    EXPECT_EQ(controls.input(IPTV_INPUT_CROSS, 3), 1);
+    EXPECT_FALSE(controls.quality_selection());
+    quality.count = 2;
+    quality.variants[0] = {2000000, 1280, 720, IPTV_HLS_CODEC_AVC, IPTV_HLS_VIDEO_RANGE_SDR};
+    controls.set_quality_state(quality);
+    ASSERT_NE(std::getenv("KIT_FONTS"), nullptr);
+    ASSERT_TRUE(controls.load_fonts(std::getenv("KIT_FONTS")));
+    std::vector<std::uint8_t> video(1920 * 1088 * 3 / 2, 77);
+    EXPECT_TRUE(controls.draw(video.data(), video.size(), 1920, 1088, 1920, 1080, 8, 3));
+    EXPECT_EQ(controls.input(IPTV_INPUT_DOWN, 4), 1);
+    EXPECT_EQ(controls.input(IPTV_INPUT_DOWN, 5), 1);
+    EXPECT_EQ(controls.input(IPTV_INPUT_CROSS, 6), 1); // Unsupported row cannot reopen.
+    EXPECT_FALSE(controls.quality_selection());
+    EXPECT_EQ(controls.input(IPTV_INPUT_UP, 7), 1);
+    EXPECT_EQ(controls.input(IPTV_INPUT_CROSS, 8), 2);
+    ASSERT_TRUE(controls.quality_selection());
+    EXPECT_EQ(controls.quality_selection()->bandwidth, 2000000u);
+    ptv::PlaybackResume resume;
+    resume.audio.count = 1;
+    resume.audio.tracks[0] = {101, 15, "eng", 0};
+    resume.audio.selected_pid = 101;
+    resume.audio.delay_ms = 250;
+    resume.subtitles.tracks = {{1, iptv::SubtitleCodec::webvtt, "en", "English", false, false}};
+    resume.subtitles.selected = 1;
+    resume.media.paused = 1;
+    controls.restore_playback(resume);
+    EXPECT_EQ(controls.take_audio_delay(), 250);
+    auto audio = resume.audio;
+    audio.tracks[0].pid = 202;
+    audio.selected_pid = 202;
+    controls.set_audio_state(audio);
+    EXPECT_EQ(controls.take_audio_selection(), 202u);
+    auto subtitles = resume.subtitles;
+    subtitles.tracks[0].id = 9;
+    controls.set_subtitle_state(subtitles);
+    EXPECT_EQ(controls.take_subtitle_selection(), 9u);
+    iptv_player_media_state_t media{};
+    controls.set_media_state(media);
+    EXPECT_FALSE(controls.take_media_pause());
+    media.available = 1;
+    controls.set_media_state(media);
+    EXPECT_EQ(controls.take_media_pause(), true);
+    controls.set_media_state(media);
+    EXPECT_FALSE(controls.take_media_pause());
+    controls.restore_playback(resume);
+    audio.tracks[0] = {303, 15, "spa", 0};
+    controls.set_audio_state(audio);
+    EXPECT_FALSE(controls.take_audio_selection());
+    resume.audio.disabled = 1;
+    controls.restore_playback(resume);
+    controls.set_audio_state(audio);
+    EXPECT_EQ(controls.take_audio_selection(), 0u);
+    subtitles.tracks[0].language = "es";
+    controls.set_subtitle_state(subtitles);
+    EXPECT_EQ(controls.take_subtitle_selection(), 0u);
+    request.live = true;
+    ptv::PlaybackOsd live(model, request);
+    live.set_quality_state(quality);
+    EXPECT_EQ(live.input(IPTV_INPUT_OPTIONS, 1), 1);
+    EXPECT_EQ(live.input(IPTV_INPUT_L1, 2), 1);
+    EXPECT_EQ(live.input(IPTV_INPUT_CIRCLE, 3), 1);
+    EXPECT_FALSE(live.quality_selection());
+    model.close();
 }
