@@ -573,6 +573,11 @@ void App::apply_settings()
 void App::handle_screen(const InputFrame &input, ui::Feedback &feedback)
 {
     Model &model = shared_.model;
+    if (tabs_.active() == kSources && sources_.choosing_user_agent())
+    {
+        sources_.handle(input, feedback);
+        return;
+    }
     if (multiview_.choosing() && (input.is_pressed(Action::back) || input.is_pressed(Action::l3)))
     {
         multiview_.cancel_choice();
@@ -1445,9 +1450,10 @@ void App::draw_hints(ui::Canvas &canvas) const
     default:
         break;
     }
-    if (tabs_.active() < kSettings && tabs_.active() != kVod)
+    const bool source_picker = tabs_.active() == kSources && sources_.choosing_user_agent();
+    if (!source_picker && tabs_.active() < kSettings && tabs_.active() != kVod)
         hints[count++] = {ui::Button::options, tr("Update")};
-    if (tabs_.active() != kLive && tabs_.active() != kVod &&
+    if (!source_picker && tabs_.active() != kLive && tabs_.active() != kVod &&
         !(browsing() && shared_.model.filtering()))
         hints[count++] = {ui::Button::circle, tr("Live TV")};
     ui::HintLayout layout;
