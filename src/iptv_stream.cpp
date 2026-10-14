@@ -969,6 +969,20 @@ static int parse_pmt_section(iptv_stream_session_t *session, impl_t *impl, const
     size_t subtitle_track_count = 0;
     if (at > end)
         return fail(session, IPTV_STREAM_MALFORMED_TS, "PMT program descriptors exceed section");
+    // Stream type 0x82 is DTS in a Blu-ray-style programme (registration "HDMV") and SCTE-27
+    // subtitles in a North American broadcast: it is sound only where the programme or the
+    // track itself says DTS.
+    bool hdmv_programme = false;
+    for (size_t descriptor = 12u; descriptor + 2u <= at;)
+    {
+        const uint8_t tag = section[descriptor], length = section[descriptor + 1u];
+        descriptor += 2u;
+        if (descriptor + length > at)
+            break;
+        hdmv_programme |=
+            tag == 0x05u && length >= 4u && std::memcmp(section + descriptor, "HDMV", 4) == 0;
+        descriptor += length;
+    }
     while (at + 5u <= end)
     {
         const uint8_t type = section[at];
@@ -980,6 +994,7 @@ static int parse_pmt_section(iptv_stream_session_t *session, impl_t *impl, const
             return fail(session, IPTV_STREAM_MALFORMED_TS,
                         "PMT elementary descriptors exceed section");
         uint8_t audio_type = type;
+        bool says_dts = hdmv_programme;
         iptv_stream_audio_track_t track{};
         track.pid = pid;
         for (size_t descriptor = at; descriptor < at + info;)
@@ -990,6 +1005,12 @@ static int parse_pmt_section(iptv_stream_session_t *session, impl_t *impl, const
             descriptor += 2u;
             if (descriptor + length > at + info)
                 return fail(session, IPTV_STREAM_MALFORMED_TS, "invalid PMT descriptor");
+            const bool registration = tag == 0x05u && length >= 4u;
+            const bool dts = tag == 0x7bu ||
+                             (registration && (std::memcmp(section + descriptor, "DTS1", 4) == 0 ||
+                                               std::memcmp(section + descriptor, "DTS2", 4) == 0 ||
+                                               std::memcmp(section + descriptor, "DTS3", 4) == 0));
+            says_dts |= dts || (registration && std::memcmp(section + descriptor, "HDMV", 4) == 0);
             if (type == 0x06u)
             {
                 if (tag == 0x6au || (tag == 0x05u && length >= 4u &&
@@ -998,6 +1019,8 @@ static int parse_pmt_section(iptv_stream_session_t *session, impl_t *impl, const
                 if (tag == 0x7au || (tag == 0x05u && length >= 4u &&
                                      std::memcmp(section + descriptor, "EAC3", 4) == 0))
                     audio_type = 0x87u;
+                if (dts)
+                    audio_type = 0x82u;
             }
             if (tag == 0x0au)
             {
@@ -1053,6 +1076,8 @@ static int parse_pmt_section(iptv_stream_session_t *session, impl_t *impl, const
                 }
             descriptor += length;
         }
+        if (type == 0x82u && !says_dts)
+            audio_type = 0; // not sound: listed with the other streams below
         if (!next.video_pid && (type == 0x1bu || type == 0x24u))
         {
             next.video_pid = pid;
@@ -1768,8 +1793,18 @@ static int process_audio(iptv_stream_session_t *session, impl_t *impl)
         size_t frame_bytes = 0;
         if (iptv_audio_software_type(impl->format.audio_stream_type))
         {
-            if (impl->audio_es.size < 7u)
+            if (impl->audio_es.size < iptv_audio_frame_header_bytes(impl->format.audio_stream_type))
                 return IPTV_STREAM_OK;
+            if (const size_t skip = iptv_audio_frame_skip(impl->format.audio_stream_type,
+                                                          impl->audio_es.data, impl->audio_es.size);
+                skip && skip <= impl->audio_es.capacity)
+            {
+                if (skip > impl->audio_es.size)
+                    return IPTV_STREAM_OK;
+                buffer_erase(&impl->audio_es, skip);
+                marker_erase(&impl->audio_markers, skip, IPTV_STREAM_PTS_UNKNOWN);
+                continue;
+            }
             frame_bytes = iptv_audio_frame_info(impl->format.audio_stream_type, impl->audio_es.data,
                                                 impl->audio_es.size, &rate, &samples);
             if (!frame_bytes)
@@ -1845,7 +1880,9 @@ static int process_audio(iptv_stream_session_t *session, impl_t *impl)
             return disable_audio(session, impl,
                                  "audio format changed; continuing with silent video");
         impl->format.audio_sample_rate = rate;
-        impl->format.audio_channels = channels;
+        // An E-AC-3 dependent substream names no channels of its own: keep the frame's.
+        if (channels || !channels_may_change)
+            impl->format.audio_channels = channels;
         session->telemetry.format = impl->format;
 
         /* Keep complete frames bounded until video parameter sets permit the
