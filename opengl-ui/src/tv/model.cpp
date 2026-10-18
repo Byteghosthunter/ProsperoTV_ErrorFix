@@ -1515,6 +1515,12 @@ void Model::run_refresh()
                 }
                 pending_fetch_ = platform::fetch(endpoint.c_str(), response.data(), response.size(),
                                                  response.max_bytes, &control, &headers);
+                // Log only the stage and status. The endpoint contains the IPTV password.
+                diag::event("xtream request stage=%s fetch=%d http=%d native=0x%08x bytes=%zu",
+                            pending_account_stage_.c_str(),
+                            static_cast<int>(pending_fetch_.status), pending_fetch_.http_status,
+                            static_cast<unsigned>(pending_fetch_.native_error),
+                            pending_fetch_.bytes);
                 return pending_fetch_.status == iptv::http::Status::ok && !stopping();
             };
             pending_account_stage_ = "authentication";
@@ -1575,6 +1581,11 @@ void Model::run_refresh()
                         &receiver};
                     pending_fetch_ = platform::fetch_list(
                         endpoint.c_str(), sink, iptv::kMaxXtreamResponseBytes, &control, &headers);
+                    diag::event("xtream request stage=%s fetch=%d http=%d native=0x%08x bytes=%zu channels=%zu",
+                                pending_account_stage_.c_str(),
+                                static_cast<int>(pending_fetch_.status), pending_fetch_.http_status,
+                                static_cast<unsigned>(pending_fetch_.native_error),
+                                pending_fetch_.bytes, pending_catalog_.size());
                     // Stopped by the parser: what it says is the answer.
                     if (pending_fetch_.status == iptv::http::Status::stopped)
                         pending_fetch_.status = iptv::http::Status::ok;
