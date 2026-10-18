@@ -27,6 +27,10 @@
 #include <time.h>
 #include <math.h>
 
+/* The PS5 UI supplies these diagnostic hooks; standalone builds use the weak no-op definitions below. */
+int tv_diag_enabled(void);
+void tv_diag_line(const char *line);
+
 static atomic_uint master_volume = 100;
 static atomic_uint audio_normalization = 0;
 static atomic_uint audio_surround = 0;
@@ -2287,6 +2291,26 @@ static int32_t submit_coded_frame(backend_state_t *state, const void *coded_fram
 
     if (result != 0 || output.error)
     {
+        /* Record the failed access unit before the player tears the decoder down.
+         * This is deliberately diagnostic-only: retrying a fatal bitstream in
+         * the same VideoDec2 instance can keep it in an invalid state. */
+        if (tv_diag_enabled())
+        {
+            char diagnostic[384];
+            snprintf(diagnostic, sizeof(diagnostic),
+                     "[TVDIAG] VideoDec2 decode failure rc=0x%08X output_error=0x%08X "
+                     "au_bytes=%zu pts_us=%llu submitted=%llu codec=%u "
+                     "coded=%ux%u valid=%u accepted=%u nal_mask=0x%08X",
+                     (unsigned)(uint32_t)result, (unsigned)output.error,
+                     frame_bytes, (unsigned long long)pts_us,
+                     (unsigned long long)state->telemetry.submitted_video_access_units,
+                     (unsigned)state->config.codec,
+                     (unsigned)state->config.coded_width,
+                     (unsigned)state->config.coded_height,
+                     (unsigned)output.valid, (unsigned)frame.accepted,
+                     (unsigned)state->telemetry.last_video_nal_mask);
+            tv_diag_line(diagnostic);
+        }
         state->telemetry.decoder_output_valid = output.valid;
         state->telemetry.decoder_output_error = output.error;
         state->telemetry.decoder_output_picture_count = output.picture_count;

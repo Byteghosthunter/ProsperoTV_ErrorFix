@@ -3362,8 +3362,8 @@ static int RunPlayerOnce(const char *url, const char *channel_name, const char *
                     SetLastPlaybackError("The channel did not provide a valid video sequence "
                                          "(VideoDec2 0x811D0303).");
                 else if (native_code == UINT32_C(0x811D0304))
-                    SetLastPlaybackError("The channel contains a fatal video bitstream error "
-                                         "(VideoDec2 0x811D0304).");
+                    SetLastPlaybackError("The PS5 video decoder rejected the stream bitstream "
+                                         "(VideoDec2 0x811D0304). See diagnostics for details.");
                 else if (native_result != 0 && native_result != -125)
                     SetLastPlaybackError("The PS5 video backend failed (native error 0x%08X).",
                                          static_cast<unsigned>(native_result));
