@@ -23,6 +23,11 @@ namespace
 
 constexpr Rect kSettingsPanel{kMargin, 250.0f, 1010.0f, 640.0f};
 constexpr Rect kGlancePanel{1144.0f, 250.0f, kWidth - kMargin - 1144.0f, 640.0f};
+// A film or show count, or a dash while the source has none saved.
+std::string title_count(const std::optional<unsigned> &count)
+{
+    return count ? group_digits(*count) : std::string("—");
+}
 // The opening: the set stands in the middle; its moments, in seconds.
 constexpr Rect kIntroSet{(kWidth - 800.0f) * 0.5f, 250.0f, 800.0f, 520.0f};
 constexpr float kIntroArrive = 0.55f; // the set comes out of the dark
@@ -78,6 +83,9 @@ enum FormRow : int
     kRowShare,
     kRowLanguage,
     kRowAudioOutput,
+    kRowStatsLine,
+    kRowMovies,
+    kRowShows,
 };
 
 constexpr unsigned kAllowances[] = {0, 15, 30, 60, 90, 120, 180};
@@ -135,7 +143,7 @@ const char *source_label(iptv::SourceKind source)
     case iptv::SourceKind::BuiltIn:
         break;
     }
-    return tr("iptv-org public list");
+    return tr("No source");
 }
 
 } // namespace
@@ -177,7 +185,7 @@ App::App(Model &model, const ui::Fonts &fonts, std::uint32_t glass_texture,
     tabs_.style.padding = 10.0f;
     tabs_.style.gap = 14.0f;
     tabs_.style.track = false;
-    tabs_.style.focus_ring = false;
+    tabs_.style.focus_ring = true;
     tabs_.style.on_page = true;
     tabs_.set_tabs({{tr("Home")},
                     {tr("Live TV")},
@@ -186,7 +194,7 @@ App::App(Model &model, const ui::Fonts &fonts, std::uint32_t glass_texture,
                     {tr("Sources")},
                     {tr("Settings")},
                     {tr("About")}});
-    tabs_.set_bounds({450.0f, kHeaderY - 28.0f, 1300.0f, 56.0f});
+    tabs_.set_bounds({514.0f, kHeaderY - 28.0f, 1300.0f, 56.0f});
     tabs_.set_focused(false);
     tabs_.set_active(std::clamp(model.view.tab, 0, kTabCount - 1), true);
 
@@ -221,6 +229,8 @@ App::App(Model &model, const ui::Fonts &fonts, std::uint32_t glass_texture,
     form_.add_action(kRowForgetPhones, tr("Forget paired phones"));
     form_.add_header(tr("CHANNEL LIST"));
     form_.add_value(kRowChannels, tr("Channels"), "");
+    form_.add_value(kRowMovies, tr("Movies"), "");
+    form_.add_value(kRowShows, tr("TV shows"), "");
     form_.add_action(kRowUpdate, tr("Download it again now"));
     form_.add_toggle(kRowHideFailed, tr("Hide channels that failed"), settings.hide_failed);
     form_.add_toggle(kRowResume, tr("Start on the last channel"), settings.resume_last);
@@ -239,6 +249,8 @@ App::App(Model &model, const ui::Fonts &fonts, std::uint32_t glass_texture,
     form_.add_toggle(kRowDiagnostics, tr("Diagnostic log"), settings.diagnostics).description =
         std::string(tr("Records playback and decoder details for a problem report.")) + " " +
         diag::destination();
+    form_.add_toggle(kRowStatsLine, tr("Stats line"), settings.stats_line).description =
+        tr("Keeps the codec and performance line on screen during playback.");
     form_.add_action(kRowReport, tr("Export failure report to USB")).description =
         tr("Saves the most recent playback failure or crash without account details or stream "
            "addresses.");
@@ -295,6 +307,8 @@ App::App(Model &model, const ui::Fonts &fonts, std::uint32_t glass_texture,
     form_.set_bounds(kSettingsPanel.inset(22.0f));
     // The viewer's switch; a debug build or a scripted run keeps its own.
     diag::set_enabled(settings.diagnostics);
+    form_.set_focus(0);
+    form_top_ = form_.focus();
     form_.focus_row(kRowMotion);
 
     failure_.style.theme = theme;
@@ -330,6 +344,12 @@ void App::set_audio_surround(bool enabled)
 {
     shared_.settings.audio_surround = enabled;
     form_.set_choice(kRowAudioOutput, enabled ? 1 : 0);
+}
+
+void App::set_stats_line(bool always)
+{
+    shared_.settings.stats_line = always;
+    form_.set_toggle(kRowStatsLine, always);
 }
 
 void App::set_profile_name(std::string name)
@@ -512,6 +532,81 @@ void App::tab_changed()
     }
 }
 
+bool App::screen_at_top() const
+{
+    switch (tabs_.active())
+    {
+    case kHome:
+        return home_.at_top();
+    case kLive:
+    case kFavorites:
+        return browse_.at_top();
+    case kVod:
+        return vod_.at_top();
+    case kSources:
+        return sources_.at_top();
+    case kSettings:
+        return form_.focus() <= form_top_;
+    default:
+        return true;
+    }
+}
+
+void App::focus_tabs(bool focused, ui::Feedback &feedback)
+{
+    tabs_focused_ = focused;
+    search_focused_ = false;
+    tabs_.set_focused(focused);
+    feedback.play(audio::Cue::focus, focused ? 1.03f : 0.97f);
+}
+
+void App::open_search(ui::Feedback &feedback)
+{
+    focus_tabs(false, feedback);
+    search_.open(feedback);
+}
+
+// The TV remote has no L1, R1 or Triangle: arrows reach the tabs and search.
+void App::handle_tabs(const InputFrame &input, ui::Feedback &feedback)
+{
+    if (search_focused_)
+    {
+        if (input.is_pressed(Action::confirm))
+            open_search(feedback);
+        else if (input.nav == Direction::right)
+        {
+            search_focused_ = false;
+            tabs_.set_focused(true);
+            feedback.play(audio::Cue::focus);
+        }
+        else if (input.nav == Direction::down || input.is_pressed(Action::back))
+            focus_tabs(false, feedback);
+        else if (input.nav == Direction::left && !input.nav_repeat)
+            feedback.play(audio::Cue::error, 1.0f, 0.0f, 0.6f);
+        return;
+    }
+    if (input.nav == Direction::left && tabs_.active() == kHome)
+    {
+        if (!input.nav_repeat)
+        {
+            search_focused_ = true;
+            tabs_.set_focused(false);
+            feedback.play(audio::Cue::focus);
+        }
+        return;
+    }
+    if (input.nav == Direction::left || input.nav == Direction::right)
+    {
+        shared_.model.cancel_home_play();
+        if (tabs_.handle(input, feedback) == ui::Event::changed)
+            tab_changed();
+        return;
+    }
+    if (input.nav == Direction::down || input.is_pressed(Action::confirm) ||
+        input.is_pressed(Action::back))
+        focus_tabs(false, feedback);
+}
+
 void App::refresh(ui::Feedback &feedback)
 {
     if (tabs_.active() == kVod)
@@ -576,6 +671,7 @@ void App::apply_settings()
     next.resolution = form_.choice_index(kRowResolution) == Settings::kFullHd ? Settings::kFullHd
                                                                               : Settings::kBest;
     next.diagnostics = form_.toggle_value(kRowDiagnostics);
+    next.stats_line = form_.toggle_value(kRowStatsLine);
     next.hide_failed = form_.toggle_value(kRowHideFailed);
     next.resume_last = form_.toggle_value(kRowResume);
     next.live_preview = form_.toggle_value(kRowPreview);
@@ -657,6 +753,23 @@ void App::handle_screen(const InputFrame &input, ui::Feedback &feedback)
         refresh(feedback);
         return;
     }
+    if (multiview_.choosing())
+    {
+        tabs_focused_ = search_focused_ = false; // choosing keeps to Live TV and Favorites
+        tabs_.set_focused(false);
+    }
+    if (tabs_focused_)
+    {
+        handle_tabs(input, feedback);
+        return;
+    }
+    // A fresh Up at the top of a screen goes to the tab bar; a held one stops there.
+    if (input.nav == Direction::up && !input.nav_repeat && !multiview_.choosing() &&
+        screen_at_top())
+    {
+        focus_tabs(true, feedback);
+        return;
+    }
     if (input.is_pressed(Action::back))
     {
         if (model.cancel_home_play())
@@ -684,6 +797,8 @@ void App::handle_screen(const InputFrame &input, ui::Feedback &feedback)
             feedback.play(audio::Cue::back);
             show_tab(kLive, true);
         }
+        else if (!multiview_.choosing())
+            focus_tabs(true, feedback);
         return;
     }
 
@@ -706,6 +821,9 @@ void App::handle_screen(const InputFrame &input, ui::Feedback &feedback)
             break;
         case BrowseScreen::Result::go_live:
             show_tab(kLive, true);
+            break;
+        case BrowseScreen::Result::sources:
+            show_tab(kSources, true);
             break;
         default:
             break;
@@ -943,7 +1061,7 @@ void App::step(const InputFrame &physical, float dt, ui::Feedback &feedback)
         {
             announcements_.push(ui::StatusKind::info,
                                 "ProsperoTV " + offer.version + tr(" is available"),
-                                tr("Get it from homebrew.page."), 10.0f);
+                                tr("Get it from prosperostore.net."), 10.0f);
         }
     }
 
@@ -1099,11 +1217,15 @@ void App::step(const InputFrame &physical, float dt, ui::Feedback &feedback)
     form_.set_disabled(kRowKids, !parental.enabled());
     form_.set_disabled(kRowParentUnlock, !parental.enabled() || parental.unlocked());
     form_.set_disabled(kRowParentLock, !parental.enabled() || !parental.unlocked());
-    form_.set_value_text(kRowChannels, model.has_catalog() ? group_digits(model.channel_count())
+    form_.set_value_text(kRowChannels, model.has_catalog() ? group_digits(model.counts().channels)
                                                            : tr("None yet"));
+    form_.set_value_text(kRowMovies, title_count(model.counts().movies));
+    form_.set_value_text(kRowShows, title_count(model.counts().shows));
     follow_channel(dt);
 
     tabs_.update(dt);
+    search_focus_.target = search_focused_ ? 1.0f : 0.0f;
+    search_focus_.update(dt, 18.0f);
     browse_.update(dt);
     const bool preview_allowed =
         !sleeping_ && !multiview_.active() && browsing() && shared_.settings.live_preview &&
@@ -1170,8 +1292,14 @@ void App::draw_status(ui::Canvas &canvas) const
         dot = tone::bad;
         break;
     case Level::ready:
-        text = group_digits(model.channel_count()) + tr(" channels");
+    {
+        // Everything the source holds: its channels, films and shows together.
+        const auto &counts = model.counts();
+        text =
+            group_digits(counts.channels + counts.movies.value_or(0) + counts.shows.value_or(0)) +
+            tr(" titles");
         break;
+    }
     }
     const bool busy = model.refreshing();
     const bool reduced = shared_.settings.reduced_motion;
@@ -1208,8 +1336,14 @@ void App::draw_header(ui::Canvas &canvas) const
     const ui::GlyphStyle glyphs = ui::GlyphStyle::dark();
     const Rect first = tabs_.tab_rect(fonts, 0);
     const Rect last = tabs_.tab_rect(fonts, kTabCount - 1);
+    const Rect lens{first.x - 62.0f, kHeaderY - 22.0f, 44.0f, 44.0f};
+    ui::Painter paint(list, fonts, shared_.theme, canvas.glass);
+    paint.focus_ring(lens, lens.h * 0.5f, search_focus_.value);
+    const gfx::Color ink = search_focused_ ? shared_.theme.text : shared_.theme.text_muted;
+    list.ring(lens.cx() - 3.0f, lens.cy() - 3.0f, 9.0f, 2.5f, ink);
+    list.line(lens.cx() + 4.0f, lens.cy() + 4.0f, lens.cx() + 11.0f, lens.cy() + 11.0f, 3.0f, ink);
     const float l1 = ui::button_width(ui::Button::l1, 34.0f);
-    ui::draw_button(list, fonts, glyphs, ui::Button::l1, first.x - l1 - 20.0f, kHeaderY, 34.0f);
+    ui::draw_button(list, fonts, glyphs, ui::Button::l1, lens.x - l1 - 16.0f, kHeaderY, 34.0f);
     ui::draw_button(list, fonts, glyphs, ui::Button::r1, last.x + last.w + 20.0f, kHeaderY, 34.0f);
     draw_status(canvas);
 }
@@ -1254,7 +1388,9 @@ void App::draw_settings(ui::Canvas &canvas) const
     };
     fact(tr("Source"), source_label(model.active_source()));
     fact(tr("Channels"),
-         model.has_catalog() ? group_digits(model.channel_count()) : tr("None yet"));
+         model.has_catalog() ? group_digits(model.counts().channels) : tr("None yet"));
+    fact(tr("Movies"), title_count(model.counts().movies));
+    fact(tr("TV shows"), title_count(model.counts().shows));
     fact(tr("Favorites"), group_digits(model.group_size(Group::favorites)));
     fact(tr("Recent channels"), group_digits(model.group_size(Group::recent)));
     ui::paragraph(list, fonts.regular,
@@ -1292,6 +1428,29 @@ void App::draw_about(ui::Canvas &canvas) const
     const auto words = [&](const char *value, Color color, int lines, float size = 22.0f) {
         y = ui::paragraph(list, fonts.regular, value, x, y, size, width, size + 9.0f, color, lines);
     };
+    // Like words, but the lines level with a block on the right stop short of it.
+    const auto beside = [&](const char *value, float clear_x, float clear_bottom, float size)
+    {
+        const float step = size + 9.0f;
+        const gfx::Font &font = *fonts.regular.font;
+        std::vector<std::string> lines = font.wrap(value, size, clear_x - x);
+        std::size_t level = 0;
+        while (level < lines.size() &&
+               y + step * static_cast<float>(level) - size * 0.8f < clear_bottom)
+            ++level;
+        std::string rest;
+        for (std::size_t i = level; i < lines.size(); ++i)
+            rest += (rest.empty() ? "" : " ") + lines[i];
+        lines.resize(level);
+        if (!rest.empty())
+            for (std::string &line : font.wrap(rest, size, width))
+                lines.push_back(std::move(line));
+        for (const std::string &line : lines)
+        {
+            ui::text(list, fonts.regular, line, x, y, size, theme.text);
+            y += step;
+        }
+    };
     const auto rule = [&]()
     {
         list.rounded_rect({x, y - 6.0f, width, 1.0f}, 0.0f, rule_color);
@@ -1306,29 +1465,27 @@ void App::draw_about(ui::Canvas &canvas) const
     y = kCreditsPanel.y + 56.0f;
     ui::text(list, fonts.semibold, tr("PROJECT CREDITS"), x, y, 16.0f, tone::accent,
              gfx::Align::left, 3.0f);
-    draw_mark(list, x + 34.0f, y + 74.0f, 68.0f);
-    paint.heading("ProsperoTV", x + 88.0f, y + 74.0f, 40.0f);
-    ui::text(list, fonts.mono, tr("Version ") + version_, x + 90.0f, y + 108.0f, 20.0f,
-             theme.text_muted);
-    y += 164.0f;
-    words(
-        tr("Live television for PS5 homebrew, brought to you by BlackBearReloaded. Unofficial, and "
-           "free software under the GNU General Public License, version 3 or later."),
-        theme.text, 3, 23.0f);
-    rule();
-    kicker(tr("CHANNEL LIST"));
-    words(
-        tr("The built-in list is the public playlist of the iptv-org community project. All credit "
-           "for it goes to its maintainers."),
-        theme.text, 2);
-    ui::text(list, fonts.semibold, "github.com/iptv-org/iptv", x, y, 22.0f, tone::accent);
-    y += 31.0f;
+    // The mark, name and version sit top right, level with the kicker; the
+    // paragraph starts beside them and widens once past.
+    const float right = x + width;
+    const float name_left = right - paint.heading_width("ProsperoTV", 40.0f);
+    draw_mark(list, name_left - 54.0f, y + 20.0f, 68.0f);
+    paint.heading("ProsperoTV", right, y + 20.0f, 40.0f, gfx::Align::right);
+    ui::text(list, fonts.mono, tr("Version ") + version_, right, y + 54.0f, 20.0f, theme.text_muted,
+             gfx::Align::right);
+    const float clear_x = name_left - 116.0f;
+    const float clear_bottom = y + 62.0f;
+    y += 36.0f;
+    beside(tr("Live television for PS5 homebrew, brought to you by BlackBearReloaded and carried "
+              "on by ThatGuyKalvin. Unofficial, and free software under the GNU General Public "
+              "License, version 3 or later."),
+           clear_x, clear_bottom, 23.0f);
     rule();
     kicker(tr("THANKS"));
-    words(
-        tr("Thanks to JMUtechnologies for testing and feedback, to the whole PS5 homebrew "
-           "community, and to every developer whose tools and libraries make ProsperoTV possible."),
-        theme.text, 3);
+    words(tr("Thanks to JMUtechnologies for testing and feedback, as well as Bastian-R-dotcom, to "
+             "the whole PS5 homebrew community, and to every developer whose tools and libraries "
+             "make ProsperoTV possible."),
+          theme.text, 3);
     ui::text(list, fonts.regular, tr("Menu sound effects made with ElevenLabs."), x,
              kCreditsPanel.y + kCreditsPanel.h - 36.0f, 19.0f, theme.text_muted);
     list.pop_opacity();
@@ -1354,7 +1511,6 @@ void App::draw_about(ui::Canvas &canvas) const
                  column, y, 22.0f, theme.text);
         y += 46.0f;
     };
-    way(tr("BUILT IN"), tr("The iptv-org list, ready at the first launch"));
     way(tr("PLAYLIST"), tr("Any M3U playlist, by its web address"));
     way(tr("ACCOUNT"), tr("An Xtream Codes account from your provider"));
     y -= 6.0f;
@@ -1450,42 +1606,53 @@ void App::draw_hints(ui::Canvas &canvas) const
 {
     ui::Hint hints[9];
     int count = 0;
-    switch (tabs_.active())
+    if (search_focused_)
+        hints[count++] = {ui::Button::cross, tr("Search")};
+    else if (tabs_focused_)
     {
-    case kHome:
-        hints[count++] = {ui::Button::cross, tr("Watch")};
-        hints[count++] = {ui::Button::triangle, tr("Search")};
-        hints[count++] = {ui::Button::dpad, tr("Choose")};
-        break;
-    case kLive:
-    case kFavorites:
-        count = browse_.hints(hints, 5);
-        hints[count++] = {ui::Button::touchpad,
-                          tabs_.active() == kFavorites ? tr("Folders") : tr("Categories")};
-        hints[count++] = {ui::Button::left_stick, multiview_.pinned()
-                                                      ? tr("Close picture in picture")
-                                                  : multiview_.choosing() ? tr("Back to multiview")
-                                                                          : tr("Multiview")};
-        break;
-    case kSources:
-        count = sources_.hints(hints, 6);
-        break;
-    case kVod:
-        count = vod_.hints(hints, 7);
-        break;
-    case kSettings:
-        if (form_.uses_horizontal())
-            hints[count++] = {ui::Button::dpad, tr("Change")};
-        else
-            hints[count++] = {ui::Button::cross, tr("Choose")};
-        break;
-    default:
-        break;
+        hints[count++] = {ui::Button::dpad, tr("Switch tab")};
+        hints[count++] = {ui::Button::cross, tr("Open")};
     }
-    const bool source_picker = tabs_.active() == kSources && sources_.choosing_user_agent();
-    if (!source_picker && tabs_.active() < kSettings && tabs_.active() != kVod)
+    else
+    {
+        switch (tabs_.active())
+        {
+        case kHome:
+            hints[count++] = {ui::Button::cross, tr("Watch")};
+            hints[count++] = {ui::Button::triangle, tr("Search")};
+            hints[count++] = {ui::Button::dpad, tr("Choose")};
+            break;
+        case kLive:
+        case kFavorites:
+            count = browse_.hints(hints, 5);
+            hints[count++] = {ui::Button::touchpad,
+                              tabs_.active() == kFavorites ? tr("Folders") : tr("Categories")};
+            hints[count++] = {ui::Button::left_stick,
+                              multiview_.pinned()     ? tr("Close picture in picture")
+                              : multiview_.choosing() ? tr("Back to multiview")
+                                                      : tr("Multiview")};
+            break;
+        case kSources:
+            count = sources_.hints(hints, 6);
+            break;
+        case kVod:
+            count = vod_.hints(hints, 7);
+            break;
+        case kSettings:
+            if (form_.uses_horizontal())
+                hints[count++] = {ui::Button::dpad, tr("Change")};
+            else
+                hints[count++] = {ui::Button::cross, tr("Choose")};
+            break;
+        default:
+            break;
+        }
+    }
+    const bool own_hints =
+        tabs_focused_ || (tabs_.active() == kSources && sources_.choosing_user_agent());
+    if (!own_hints && tabs_.active() < kSettings && tabs_.active() != kVod)
         hints[count++] = {ui::Button::options, tr("Update")};
-    if (!source_picker && tabs_.active() != kLive && tabs_.active() != kVod &&
+    if (!own_hints && tabs_.active() != kLive && tabs_.active() != kVod &&
         !(browsing() && shared_.model.filtering()))
         hints[count++] = {ui::Button::circle, tr("Live TV")};
     ui::HintLayout layout;

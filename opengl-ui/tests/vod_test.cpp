@@ -21,6 +21,7 @@ namespace
 class VodTest : public ::testing::Test
 {
   protected:
+    static constexpr std::int64_t kServer = 5;
     void SetUp() override
     {
         host::reset();
@@ -54,6 +55,16 @@ class VodTest : public ::testing::Test
                                 {},
                                 ptv::RefreshSchedule::manual};
         ASSERT_TRUE(library.save_source(&source));
+        // A second source with nothing on demand, to switch to.
+        ptv::SavedSource server{kServer,
+                                5,
+                                "Test server",
+                                "http://tvheadend.invalid:9981",
+                                {},
+                                {},
+                                {},
+                                ptv::RefreshSchedule::manual};
+        ASSERT_TRUE(library.save_source(&server));
         ASSERT_TRUE(library.select_source(3));
         auto catalog =
             iptv::ParseExtendedM3u("#EXTM3U\n#EXTINF:-1,Live\nhttps://stream.invalid/live.ts\n",
@@ -290,7 +301,7 @@ TEST_F(VodTest, MissingHomeSeriesFetchCanCancelAndFallsBackToSavedEpisode)
     EXPECT_FALSE(model.take_play_request(&request));
     ASSERT_TRUE(model.play_home(id, true));
     model.poll();
-    model.use_saved_source(1);
+    model.use_saved_source(kServer);
     EXPECT_FALSE(model.take_play_request(&request));
     model.close();
     model.use_saved_source(3);
@@ -425,6 +436,66 @@ TEST_F(VodTest, UnifiedSearchLoadsBothKindsWithoutChangingBrowseAndRoutesSafely)
     model.close();
 }
 
+TEST_F(VodTest, SourceCountsCoverChannelsFilmsAndShows)
+{
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    ASSERT_TRUE(settle(model));
+    EXPECT_EQ(model.counts().channels, 1u);
+    EXPECT_FALSE(model.counts().movies.has_value()); // no saved lists yet
+    EXPECT_FALSE(model.counts().shows.has_value());
+    model.set_vod_overview(true);
+    for (int i = 0; i < 600 && model.search_loading(); ++i)
+    {
+        model.poll();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    ASSERT_FALSE(model.search_loading()) << model.search_status();
+    model.poll();
+    EXPECT_EQ(model.counts().movies, 2u);
+    EXPECT_EQ(model.counts().shows, 1u);
+    model.close();
+    // The saved lists count on the next start, without being read in full.
+    ptv::Model again(dir);
+    ASSERT_TRUE(again.open());
+    EXPECT_EQ(again.counts().movies, 2u);
+    EXPECT_EQ(again.counts().shows, 1u);
+    again.close();
+}
+TEST_F(VodTest, PlaylistCountsItsLiveChannelsFilmsAndShows)
+{
+    const std::string playlist = dir + "/plus.m3u";
+    std::ofstream(playlist) << "#EXTM3U\n"
+                               "#EXTINF:-1 group-title=\"News\",Live\n"
+                               "https://provider.invalid/sub/user/pass/1.ts\n"
+                               "#EXTINF:-1 group-title=\"Movies\",Film one\n"
+                               "https://provider.invalid/sub/movie/user/pass/42.mkv\n"
+                               "#EXTINF:-1 group-title=\"Movies\",Film two\n"
+                               "https://provider.invalid/sub/movie/user/pass/43.mkv\n"
+                               "#EXTINF:-1 group-title=\"Series\",Show A S01E01\n"
+                               "https://provider.invalid/sub/series/user/pass/501.mkv\n"
+                               "#EXTINF:-1 group-title=\"Series\",Show A S01E02\n"
+                               "https://provider.invalid/sub/series/user/pass/502.mkv\n"
+                               "#EXTINF:-1 group-title=\"Series\",Show B S01E01\n"
+                               "https://provider.invalid/sub/series/user/pass/601.mkv\n";
+    const std::string url = "https://provider.invalid/sub/get.php?username=user&password=pass";
+    host::set_network_response(url, playlist);
+    {
+        ptv::Library library;
+        ASSERT_TRUE(library.open(dir + "/prosperotv-library.sqlite3"));
+        ptv::SavedSource source{4, 1, "Plus", url, {}, {}, {}, ptv::RefreshSchedule::manual};
+        ASSERT_TRUE(library.save_source(&source));
+        ASSERT_TRUE(library.select_source(4));
+    }
+    ptv::Model model(dir);
+    ASSERT_TRUE(model.open());
+    ASSERT_TRUE(settle(model));
+    EXPECT_EQ(model.channel_count(), 6u);
+    EXPECT_EQ(model.counts().channels, 1u);
+    EXPECT_EQ(model.counts().movies, 2u);
+    EXPECT_EQ(model.counts().shows, 2u);
+    model.close();
+}
 TEST_F(VodTest, OpenSearchFollowsInitialAndReplacementPlaylistDownloads)
 {
     const std::string url = "https://provider.invalid/list.m3u";
@@ -766,7 +837,7 @@ TEST_F(VodTest, OverviewCountsTitlesAndDisablesOnlyConfirmedEmptyLists)
     ASSERT_EQ(model.view.vod_kind, -1);
     settle_counts(model);
     EXPECT_EQ(model.vod_count(ptv::VodKind::movies), 0u);
-    model.use_saved_source(1);
+    model.use_saved_source(kServer);
     screen.update();
     EXPECT_EQ(model.vod_count(ptv::VodKind::movies), 0u);
     EXPECT_EQ(model.vod_count(ptv::VodKind::series), 0u);
@@ -1088,6 +1159,9 @@ TEST_F(VodTest, FilmControlsClampSkipsPauseAndSelectChapters)
     controls.set_media_state(state);
     EXPECT_EQ(controls.input(IPTV_INPUT_PLAY_PAUSE, 5), 1);
     EXPECT_EQ(controls.take_media_pause(), true);
+    EXPECT_EQ(controls.input(IPTV_INPUT_CROSS, 5), 1); // Cross is pause too.
+    EXPECT_EQ(controls.take_media_pause(), true);
+    EXPECT_EQ(controls.input(IPTV_INPUT_L2, 5), 0); // No channel list on demand.
     EXPECT_EQ(controls.input(IPTV_INPUT_OPTIONS, 6), 1);
     EXPECT_EQ(controls.input(IPTV_INPUT_UP, 7), 1);    // Chapters, the last row.
     EXPECT_EQ(controls.input(IPTV_INPUT_CROSS, 7), 1); // At the chapter playing.
@@ -1149,10 +1223,10 @@ TEST_F(VodTest, SoundDelayChangesOnlyInsideAudioMenuAndIsBounded)
     EXPECT_EQ(controls.input(IPTV_INPUT_GO_LIVE, 2), 1);
     EXPECT_EQ(controls.take_audio_delay(), 50);
     EXPECT_FALSE(controls.take_audio_delay());
-    EXPECT_EQ(controls.input(IPTV_INPUT_PLAY_PAUSE, 3), 1);
+    EXPECT_EQ(controls.input(IPTV_INPUT_L2, 3), 1);
     EXPECT_EQ(controls.take_audio_delay(), 0);
     for (unsigned i = 0; i < 45; ++i)
-        controls.input(IPTV_INPUT_PLAY_PAUSE, 4 + i);
+        controls.input(IPTV_INPUT_L2, 4 + i);
     EXPECT_EQ(controls.take_audio_delay(), -2000);
     for (unsigned i = 0; i < 90; ++i)
         controls.input(IPTV_INPUT_GO_LIVE, 50 + i);
@@ -1165,8 +1239,11 @@ TEST_F(VodTest, SoundDelayChangesOnlyInsideAudioMenuAndIsBounded)
     controls.input(IPTV_INPUT_LEFT, 152);
     controls.input(IPTV_INPUT_LEFT, 153);
     EXPECT_EQ(controls.take_audio_delay(), -10);
-    controls.input(IPTV_INPUT_PLAY_PAUSE, 154);
+    controls.input(IPTV_INPUT_L2, 154);
     EXPECT_EQ(controls.take_audio_delay(), -60);
+    // Play pauses through the open menu and leaves the delay alone.
+    EXPECT_EQ(controls.input(IPTV_INPUT_PLAY_PAUSE, 154), 0);
+    EXPECT_FALSE(controls.take_audio_delay());
     EXPECT_EQ(controls.input(IPTV_INPUT_SQUARE, 155), 1);
     EXPECT_EQ(controls.take_audio_delay(), 0);
     EXPECT_EQ(controls.input(IPTV_INPUT_CIRCLE, 156), 1);
@@ -1196,7 +1273,7 @@ TEST_F(VodTest, EmptyListsAreValidAndCancellationStopsTheWorker)
     model.poll();
     ASSERT_TRUE(model.vod().busy());
     const auto began = std::chrono::steady_clock::now();
-    model.use_saved_source(1);
+    model.use_saved_source(kServer);
     EXPECT_LT(std::chrono::steady_clock::now() - began, std::chrono::seconds(2));
     EXPECT_FALSE(model.vod().available());
     EXPECT_FALSE(model.vod().busy());
@@ -1280,7 +1357,8 @@ TEST_F(VodTest, DetailsAskedWhileTheListUpdatesArriveInsteadOfBeingDropped)
     // downloaded, were dropped, and the panel said the provider gave no synopsis.
     std::string info;
     ASSERT_TRUE(iptv::BuildXtreamApiUrl(account, "get_vod_info", &info));
-    reply(info + "&vod_id=10", R"({"info":{"plot":"Arrives anyway"},"movie_data":{"stream_id":10}})");
+    reply(info + "&vod_id=10",
+          R"({"info":{"plot":"Arrives anyway"},"movie_data":{"stream_id":10}})");
     ptv::Model model(dir);
     ASSERT_TRUE(model.open());
     model.vod().select(ptv::VodKind::movies);
@@ -1313,12 +1391,11 @@ TEST_F(VodTest, PlaylistFilmsFromAnXtreamServerGetTheirDetailsFromIt)
     // M3U Plus from an Xtream server names each film <server>/movie/<user>/<password>/<id>.<ext>;
     // the same server answers get_vod_info for it with that account.
     const std::string playlist = dir + "/plus.m3u";
-    std::ofstream(playlist)
-        << "#EXTM3U\n"
-           "#EXTINF:-1 group-title=\"Movies\",Film\n"
-           "https://provider.invalid/sub/movie/user%40home/p%26ss/42.mkv\n"
-           "#EXTINF:-1 group-title=\"Movies\",Elsewhere\n"
-           "https://cdn.invalid/films/elsewhere.mp4\n";
+    std::ofstream(playlist) << "#EXTM3U\n"
+                               "#EXTINF:-1 group-title=\"Movies\",Film\n"
+                               "https://provider.invalid/sub/movie/user%40home/p%26ss/42.mkv\n"
+                               "#EXTINF:-1 group-title=\"Movies\",Elsewhere\n"
+                               "https://cdn.invalid/films/elsewhere.mp4\n";
     const std::string url =
         "https://provider.invalid/sub/get.php?username=user%40home&password=p%26ss&type=m3u_plus";
     host::set_network_response(url, playlist);

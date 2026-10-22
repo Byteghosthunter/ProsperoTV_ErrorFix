@@ -69,6 +69,7 @@ class App
     void set_volume(int volume);
     void set_audio_normalization(bool enabled);
     void set_audio_surround(bool enabled);
+    void set_stats_line(bool always);
     void set_pairing_info(std::string url, std::string code, unsigned seconds, unsigned phones);
     bool pairing_open() const
     {
@@ -178,6 +179,14 @@ class App
     {
         return browsing() && browse_.on_letters();
     }
+    bool tabs_focused() const
+    {
+        return tabs_focused_;
+    }
+    bool search_focused() const
+    {
+        return tabs_focused_ && search_focused_;
+    }
 
   private:
     enum Tab : int
@@ -201,6 +210,10 @@ class App
     void refresh(ui::Feedback &feedback);
     void open_failure(ui::Feedback &feedback);
     void handle_screen(const InputFrame &input, ui::Feedback &feedback);
+    bool screen_at_top() const;
+    void focus_tabs(bool focused, ui::Feedback &feedback);
+    void handle_tabs(const InputFrame &input, ui::Feedback &feedback);
+    void open_search(ui::Feedback &feedback);
     void apply_settings();
     void follow_channel(float dt);
 
@@ -251,7 +264,11 @@ class App
     bool pairing_open_ = false, pair_requested_ = false, forget_requested_ = false;
     bool settings_changed_ = false;
     bool failure_seen_ = false;
-    float page_age_ = 10.0f; // seconds since the tab changed
+    float page_age_ = 10.0f;      // seconds since the tab changed
+    bool tabs_focused_ = false;
+    bool search_focused_ = false;
+    tween::Spring search_focus_;
+    int form_top_ = -1; // the settings form's first focusable row
     // The backdrop leans toward the colour of the channel in focus.
     ui::SpringColor lean_;
     ui::SpringColor lean_dark_;

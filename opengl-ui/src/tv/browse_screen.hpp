@@ -26,6 +26,7 @@ class BrowseScreen
         selected, // a channel was chosen for multiview; no foreground playback
         search,   // open the search sheet
         go_live,  // the favorites list is empty: go and find some
+        sources,  // there is no source yet: go and add one
     };
 
     explicit BrowseScreen(Shared &shared);
@@ -40,6 +41,8 @@ class BrowseScreen
     Result handle(const InputFrame &input, ui::Feedback &feedback);
     // One step back inside the screen. False when there is nowhere to go.
     bool back(ui::Feedback &feedback);
+    // Up here goes to the tab bar.
+    bool at_top() const;
     void update(float dt);
     void draw(ui::Canvas &canvas) const;
     int hints(ui::Hint *out, int capacity) const;

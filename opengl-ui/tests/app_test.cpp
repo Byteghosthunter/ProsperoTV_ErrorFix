@@ -104,6 +104,7 @@ class AppTest : public ::testing::Test
         playlist_ = dir_ + "/playlist.m3u";
         std::ofstream(playlist_) << playlist_text();
         host::set_network(true, playlist_);
+        host::add_playlist_source(dir_);
         model_ = std::make_unique<ptv::Model>(dir_);
         ASSERT_TRUE(model_->open());
         for (int i = 0; i < 400 && model_->refreshing(); ++i)
@@ -621,6 +622,96 @@ TEST_F(AppTest, ShouldersTurnTheTabsAndCircleLeadsLiveTv)
     EXPECT_EQ(model_->group(), ptv::Group::all);
 }
 
+TEST_F(AppTest, ArrowsReachTheTabBarFromTheTopOfEveryScreen)
+{
+    move(Direction::up);
+    EXPECT_FALSE(app_->tabs_focused());
+    move(Direction::up);
+    EXPECT_TRUE(app_->tabs_focused());
+    move(Direction::up);
+    EXPECT_TRUE(app_->tabs_focused());
+    move(Direction::right);
+    EXPECT_EQ(app_->tab(), 2);
+    EXPECT_TRUE(app_->tabs_focused());
+    move(Direction::right);
+    EXPECT_EQ(app_->tab(), 3);
+    EXPECT_EQ(model_->group(), ptv::Group::favorites);
+    move(Direction::down);
+    EXPECT_FALSE(app_->tabs_focused());
+    move(Direction::up); // an empty Favorites list is its own top
+    EXPECT_TRUE(app_->tabs_focused());
+    move(Direction::left);
+    move(Direction::left);
+    EXPECT_EQ(app_->tab(), 1);
+    press(Action::confirm);
+    EXPECT_FALSE(app_->tabs_focused());
+    ptv::PlayRequest request;
+    EXPECT_FALSE(model_->take_play_request(&request)); // OK only went back into the list
+
+    // Back on Live TV with nothing left to undo goes to the bar, and back again.
+    press(Action::back);
+    EXPECT_TRUE(app_->tabs_focused());
+    press(Action::back);
+    EXPECT_FALSE(app_->tabs_focused());
+    EXPECT_EQ(app_->tab(), 1);
+
+    // Settings: only Up from its first row leaves it.
+    move(Direction::up);
+    move(Direction::up);
+    for (int i = 0; i < 4; ++i)
+        move(Direction::right);
+    EXPECT_EQ(app_->tab(), 5);
+    move(Direction::down);
+    const std::string first = app_->settings_row();
+    move(Direction::down);
+    ASSERT_NE(app_->settings_row(), first);
+    move(Direction::up);
+    EXPECT_EQ(app_->settings_row(), first);
+    EXPECT_FALSE(app_->tabs_focused());
+    move(Direction::up);
+    EXPECT_TRUE(app_->tabs_focused());
+    move(Direction::right);
+    EXPECT_EQ(app_->tab(), 6);
+    move(Direction::right);
+    EXPECT_EQ(app_->tab(), 6);
+}
+
+TEST_F(AppTest, LeftOfTheFirstTabIsSearch)
+{
+    move(Direction::up);
+    move(Direction::up);
+    move(Direction::left);
+    ASSERT_EQ(app_->tab(), 0);
+    EXPECT_FALSE(app_->search_focused());
+    move(Direction::left);
+    EXPECT_TRUE(app_->search_focused());
+    move(Direction::left);
+    EXPECT_TRUE(app_->search_focused());
+    move(Direction::right);
+    EXPECT_FALSE(app_->search_focused());
+    EXPECT_TRUE(app_->tabs_focused());
+    EXPECT_EQ(app_->tab(), 0);
+    move(Direction::left);
+    press(Action::confirm);
+    EXPECT_TRUE(app_->searching());
+    EXPECT_FALSE(app_->tabs_focused());
+    press(Action::back);
+    EXPECT_FALSE(app_->searching());
+    EXPECT_EQ(app_->tab(), 0);
+}
+
+TEST_F(AppTest, AHeldUpStopsAtTheTopOfTheScreen)
+{
+    move(Direction::up);
+    hui::InputFrame input;
+    input.connected = true;
+    input.nav = Direction::up;
+    input.nav_repeat = true;
+    frame(input);
+    idle(12);
+    EXPECT_FALSE(app_->tabs_focused());
+}
+
 TEST_F(AppTest, SquareStarsAndTheFavoritesTabListsIt)
 {
     move(Direction::right);
@@ -745,6 +836,24 @@ TEST_F(AppTest, UnifiedSearchResultsOpenTheSelectedLiveChannel)
     EXPECT_EQ(request.channel_name, "Channel 03 (576p)");
 }
 
+TEST_F(AppTest, ArrowsAndOkSearchAndPlayAResult)
+{
+    move(Direction::up);
+    move(Direction::up);
+    move(Direction::left);
+    move(Direction::left); // the magnifier
+    press(Action::confirm);
+    ASSERT_TRUE(app_->searching());
+    host::set_keyboard_text("channel 03");
+    press(Action::confirm);
+    move(Direction::left); // from the field to the results
+    press(Action::confirm);
+    EXPECT_FALSE(app_->searching());
+    ptv::PlayRequest request;
+    ASSERT_TRUE(model_->take_play_request(&request));
+    EXPECT_EQ(request.channel_name, "Channel 03 (576p)");
+}
+
 TEST_F(AppTest, SquareInTheDrawerResetsAndCircleClosesIt)
 {
     press(Action::north);
@@ -777,13 +886,26 @@ TEST_F(AppTest, AChannelThatFailedIsAskedAboutFirst)
     EXPECT_EQ(request.channel_id, id);
 }
 
-TEST_F(AppTest, ASourceIsSetUpFromItsRow)
+TEST_F(AppTest, WithNoSourceLiveTvLeadsToSourcesWhereOneIsSetUp)
 {
-    press(Action::page_next);
-    press(Action::page_next);
-    press(Action::page_next); // Sources
-    move(Direction::down);    // Custom playlist
-    press(Action::confirm);   // not set up: its form
+    // A console that has never had a source: nothing is downloaded.
+    app_.reset();
+    model_->close();
+    const std::string fresh = dir_ + "/fresh";
+    fs::create_directories(fresh);
+    const int fetches = host::fetch_count();
+    model_ = std::make_unique<ptv::Model>(fresh);
+    ASSERT_TRUE(model_->open());
+    EXPECT_FALSE(model_->refreshing());
+    EXPECT_FALSE(model_->has_catalog());
+    EXPECT_FALSE(model_->catalog_failed());
+    EXPECT_EQ(host::fetch_count(), fetches);
+    model_->view.tab = 1;
+    make_app();
+    ASSERT_EQ(app_->tab(), 1);
+    press(Action::confirm); // Open Sources
+    ASSERT_EQ(app_->tab(), 4);
+    press(Action::confirm); // Custom playlist, the first row: not set up, its form
     EXPECT_EQ(host::keyboard_requests(), 1);
     EXPECT_EQ(host::keyboard_title(), "Playlist address");
     host::set_keyboard_text("https://lists.example.invalid/mine.m3u");
@@ -795,15 +917,14 @@ TEST_F(AppTest, ASourceIsSetUpFromItsRow)
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     EXPECT_TRUE(model_->has_catalog());
-    EXPECT_EQ(model_->view.focused_source, 1);
+    EXPECT_EQ(model_->view.focused_source, 0);
 }
 
 TEST_F(AppTest, SourceUserAgentPickerCancelsSelectsPresetsAndRetainsCustomEntry)
 {
     press(Action::page_next);
     press(Action::page_next);
-    press(Action::page_next);
-    move(Direction::down);
+    press(Action::page_next); // Sources: the playlist in use is the first row
     const auto selected = model_->selected_source_id();
     press(Action::jump_next);
     press(Action::page_next); // The chooser owns input until selected or cancelled.
@@ -1074,6 +1195,22 @@ bool traced(const std::string &part)
     return false;
 }
 
+TEST_F(AppTest, TheStatsLineIsASwitchInSettingsOffByDefault)
+{
+    EXPECT_FALSE(app_->settings().stats_line);
+    press(Action::page_next);
+    press(Action::page_next);
+    press(Action::page_next);
+    press(Action::page_next);
+    EXPECT_EQ(app_->tab(), 5);
+    settings_row("Stats line");
+    press(Action::confirm);
+    EXPECT_TRUE(app_->settings().stats_line);
+    EXPECT_TRUE(app_->take_settings_changed());
+    press(Action::confirm);
+    EXPECT_FALSE(app_->settings().stats_line);
+    EXPECT_TRUE(app_->take_settings_changed());
+}
 TEST_F(AppTest, TheDiagnosticLogIsASwitchInSettingsOffByDefault)
 {
     g_traced.clear();
@@ -2005,7 +2142,8 @@ TEST_F(AppTest, SourceCheckRowStartsAndCancelsWithoutChangingSource)
     press(Action::page_next);
     press(Action::page_next);
     ASSERT_EQ(app_->tab(), 4);
-    for (std::size_t i = 0; i < model_->saved_sources().size(); ++i)
+    // Every source has a row but the empty first slot.
+    for (std::size_t i = 1; i < model_->saved_sources().size(); ++i)
         move(Direction::down);
     host::set_preview_probe(static_cast<int>(ptv::ProbeOutcome::unknown), 0, 1000);
     press(Action::confirm);

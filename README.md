@@ -6,15 +6,15 @@
 
 <p align="center">
   <strong>A native IPTV client for PlayStation 5 homebrew</strong><br>
-  Browse, search, and save channels from iptv-org, custom M3U playlists, or
-  your own Xtream Codes provider with an offline-first SQLite cache, a
+  Browse, search, and save channels from your own M3U playlists or Xtream
+  Codes provider with an offline-first SQLite cache, a
   controller-first interface, native PS5 video decoding, and updates that
   install themselves.
 </p>
 
 <p align="center">
-  <a href="https://github.com/blackbearreloaded/ProsperoTV/actions/workflows/tooling.yml"><img src="https://github.com/blackbearreloaded/ProsperoTV/actions/workflows/tooling.yml/badge.svg" alt="Build"></a>
-  <a href="https://github.com/blackbearreloaded/ProsperoTV/releases/latest"><img src="https://img.shields.io/github/v/release/blackbearreloaded/ProsperoTV?display_name=tag" alt="Latest release"></a>
+  <a href="https://github.com/ThatGuyKalvin/ProsperoTV/actions/workflows/tooling.yml"><img src="https://github.com/ThatGuyKalvin/ProsperoTV/actions/workflows/tooling.yml/badge.svg" alt="Build"></a>
+  <a href="https://github.com/ThatGuyKalvin/ProsperoTV/releases/latest"><img src="https://img.shields.io/github/v/release/ThatGuyKalvin/ProsperoTV?display_name=tag" alt="Latest release"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue.svg" alt="GPL-3.0-or-later"></a>
 </p>
 
@@ -22,15 +22,14 @@
 
 > [!NOTE]
 > **Version 01.000.020 brings a new interface.** It is built on
-> [ps5-homebrew-ui](https://github.com/blackbearreloaded/ps5-homebrew-ui) and lives in
+> [ps5-homebrew-ui](https://github.com/LedyBacer/ps5-homebrew-ui) and lives in
 > [`opengl-ui/`](opengl-ui/); the catalog, the stores, and the player are the ones earlier
 > versions used. Coming from 01.000.015 or older: see [Updating ProsperoTV](#updating-prosperotv).
 
 ## Highlights
 
-- Browse thousands of community-maintained IPTV channels from the iptv-org
-  catalog, add a custom HTTP(S) M3U playlist, or connect an Xtream Codes
-  account.
+- Bring your own channels: add an HTTP(S) M3U playlist or connect an Xtream
+  Codes account. ProsperoTV ships with no third-party list of its own.
 - Search by name and filter by country, language, category, and advertised
   quality with continuous controller paging.
 - Decode H.264, HEVC, and VP9 through native PS5 video paths at resolutions up
@@ -38,7 +37,7 @@
 - Keep the catalog, favorites, recent channels, and source state fast and
   persistent under `/data/prosperotv`, where an update never touches them.
 - Update from inside the app: a newer version listed on
-  [homebrew.page](https://homebrew.page) is offered at launch with its release
+  [prosperostore.net](https://prosperostore.net) is offered at launch with its release
   notes, downloaded, and installed in place.
 - Handle live HLS buffering, stale segments, alternate URLs, and failed feeds
   without destabilizing the next playback session.
@@ -49,30 +48,29 @@
 ## Project foundations
 
 > [!IMPORTANT]
-> **Built on the [PS5 Native App Boilerplate](https://github.com/blackbearreloaded/ps5-native-app-boilerplate).**
+> **Built on the [PS5 Native App Boilerplate](https://github.com/LedyBacer/ps5-native-app-boilerplate).**
 > ProsperoTV retains its C++20 application structure, reproducible clean-room
 > runtime, FSELF tooling, tests, deployment flow, and release automation.
 
 > [!IMPORTANT]
-> **Channel data comes from [iptv-org/iptv](https://github.com/iptv-org/iptv).**
-> ProsperoTV is an independent client. Neither this project nor iptv-org hosts
-> the listed streams, and channel availability can change without notice.
+> **ProsperoTV includes no channel list.** It is an independent client: every
+> channel comes from a source you add, this project hosts no streams, and
+> channel availability can change without notice.
 
 | Identity | Value |
 | --- | --- |
 | Shell title | `ProsperoTV` |
 | Title ID | `PPSA99003` |
 | Shell category | Media |
-| Current version | `01.000.070` |
+| Current version | `01.000.090` |
 | Release-version source | [`sce_sys/param.json`](sce_sys/param.json) |
-| Built-in catalog | `https://iptv-org.github.io/iptv/index.m3u` |
 | Writable data | `/data/prosperotv`; the title's own `/download0` when filesystem access is not available |
 
 ## Features
 
 ### Sources
 
-- Use the built-in iptv-org catalog, or add your own: HTTP(S) M3U/M3U8
+- Add your own sources: HTTP(S) M3U/M3U8
   playlists, Xtream Codes accounts (masked password entry), MAC-code portals
   (Stalker/Ministra style), and tuners or servers on the home network such as
   HDHomeRun and Tvheadend.
@@ -158,7 +156,8 @@
 - Codec, resolution, frame rate, and bitrate appear for five seconds when playback
   starts, with the sound's format, channels, and whether the console's decoder
   (HW) or software (SW) is decoding it, then disappear like the bottom playback
-  banner. Press **Touchpad + R1** to show them again for five seconds.
+  banner. Press **Touchpad + R1** to show them again for five seconds, or turn
+  on **Stats line** under Troubleshooting in Settings to keep them on screen.
 
 ### Picture and sound
 
@@ -208,7 +207,7 @@
   playback on the next launch. Forced termination and power loss cannot be
   recorded by the crash handler.
 - Use a full-screen OpenGL interface at up to 4K, built with the
-  [ps5-homebrew-ui](https://github.com/blackbearreloaded/ps5-homebrew-ui) kit,
+  [ps5-homebrew-ui](https://github.com/LedyBacer/ps5-homebrew-ui) kit,
   with fonts for Latin, Greek, Cyrillic, Chinese, Japanese, and Korean channel
   names, interface sounds, and a Reduce motion setting. Settings also offers
   Dusk, Ocean and Forest themes, opaque high-contrast menus, and 25% larger text
@@ -252,6 +251,9 @@ at 3840×2160. Codec and renderer details are documented in
 | R3 in the channel browser | Open the programme guide |
 | L3 in Live TV / Favorites | Open Multiview; Square chooses a channel, Triangle switches two/four tiles, R3 mutes, Cross opens full screen |
 | Options | Refresh the selected catalog source |
+| Cross during playback | Pause or resume; in the open channel list, watch the channel |
+| L2 during live TV | Open or close the channel list |
+| Up at the top of a screen, or Circle on Live TV | Focus the tabs; Left / Right change the tab, Down, Cross or Circle go back in; Left of Home is Search |
 | Circle during playback | Close the open panel, or stop playback and return to the browser |
 | Options during playback | Open or close the audio/subtitle/picture panel |
 | L1 / R1 in the playback panel | Switch between Audio, Subtitles and Picture |
@@ -261,6 +263,26 @@ During playback, Options then L1 opens Picture. Fit preserves the decoded pictur
 proportions by default; Stretch fills the screen, while 4:3 and 16:9 correct
 anamorphic or incorrectly advertised proportions. The choice lasts for the current
 playback session. Picture correction applies to live TV, movies and episodes.
+
+### TV remote
+
+The television's own remote works too, over HDMI-CEC, as it does in the
+console's menus. Turn on **Settings > System > HDMI > Enable HDMI Device Link**
+on the console (and the TV's CEC setting, for example BRAVIA Sync on Sony TVs).
+The remote can be used alongside the controller or instead of it.
+
+| Remote key | In the menu | During playback |
+| --- | --- | --- |
+| Arrows | Move focus; Up from the top of a screen reaches the tabs, Left / Right there change the tab, and Left of Home is Search | As the D-pad |
+| OK | Select, open, or play | As Cross: pause or resume, or watch the channel in the open list |
+| Back | Back | Close the open panel, or stop playback |
+| Play / Pause | Play the channel in focus | Pause or resume, even with a list or the panel open |
+| Rewind / Fast forward | Previous or next page | Step back and on, as Left and Right |
+| Channel − / Channel + | As L1 / R1, if the TV passes them on | As L1 / R1: previous or next channel on live TV |
+| Menu / Options | As Options | Open or close the playback panel |
+
+Which keys a television passes on is up to the television; arrows, OK and Back
+are the ones every CEC remote sends.
 
 ## Channels, lists and playback in detail
 
@@ -392,7 +414,7 @@ GitHub Releases provide `PPSA99003.zip`, which contains the complete
 [`opengl-ui/README.md`](opengl-ui/README.md) for how that build is put
 together. A release ZIP built by GitHub Actions can
 be checked with the GitHub CLI:
-`gh attestation verify PPSA99003.zip -R blackbearreloaded/ProsperoTV`
+`gh attestation verify PPSA99003.zip -R ThatGuyKalvin/ProsperoTV`
 (releases built from now on, not earlier ones).
 
 The repository root still builds the interface of 01.000.015 and earlier
@@ -418,7 +440,7 @@ updated by hand.
 
 ### Updating ProsperoTV
 
-From 01.000.020 on, ProsperoTV checks [homebrew.page](https://homebrew.page)
+From 01.000.020 on, ProsperoTV checks [prosperostore.net](https://prosperostore.net)
 once per launch. When a newer version is listed it offers **Update now**,
 **What's new**, and **Later**. The update downloads the release, closes the
 app, and replaces its files; sources, favorites, recent channels, and settings
@@ -440,9 +462,9 @@ favorites, history, and account the old one saved; it copies them to
 `/data/prosperotv` the first time it starts.
 
 > [!NOTE]
-> The first launch downloads, validates, and caches the iptv-org catalog. Keep
-> the console online and leave ProsperoTV open until the catalog is ready.
-> Later launches load the local database immediately.
+> ProsperoTV starts with no channels. Add a playlist or account on the Sources
+> tab; its first download is validated and cached, and later launches load the
+> local database immediately.
 
 Xtream support is for credentials supplied by the user. ProsperoTV does not
 include, sell, or discover provider accounts. The server, username, and
@@ -554,7 +576,7 @@ warning.
   stream is online, correctly labeled, or compatible with the PS5 decoder.
 
 ProsperoTV displays the most specific detected cause when a channel cannot be
-played. A channel failure does not imply that the app, iptv-org, or the
+played. A channel failure does not imply that the app, the source, or the
 console is unavailable.
 
 ## Roadmap
@@ -566,8 +588,8 @@ scheduled or promised; issues asking for one, or for something else, are welcome
 
 Thank you to the people who test ProsperoTV on their own consoles and report what they find:
 
-- **Bastian-R-dotcom** ([GitHub](https://github.com/Bastian-R-dotcom)), for the reports and requests behind Movies and TV shows, the Xtream and M3U fixes, the handling of badly formatted media, the 4K colour report and newest-first On Demand.
-- **Cold** ([GitHub](https://github.com/JMUtechnologies)), for helping with testing, and for the channel-by-channel sound measurements that found 5.1 sound playing too quietly.
+- **Bastian-R-dotcom** ([GitHub](https://github.com/Bastian-R-dotcom)), for the reports and requests behind Movies and TV shows, the Xtream and M3U fixes, the handling of badly formatted media, the 4K colour report, the film details report and newest-first On Demand.
+- **Cold** ([GitHub](https://github.com/JMUtechnologies)), for helping with testing, the channel-by-channel sound measurements that found 5.1 sound playing too quietly, and the report of channels missing from a category.
 - **Lighting999**, for the Jordan TV report that led to live playlists of any length.
 - **laurensramandt** ([GitHub](https://github.com/laurensramandt)), for asking for custom user agents.
 - **tvk-source** ([GitHub](https://github.com/tvk-source)), for asking for M3U Plus support.
@@ -576,8 +598,9 @@ Thank you to the people who test ProsperoTV on their own consoles and report wha
 
 And to the people who contribute code:
 
-- **Kalvin** ([GitHub](https://github.com/ThatGuyKalvin)), for the playback menu, channel list and controls drawn at the screen's resolution, DTS sound, lip sync timed by when each picture reaches the screen, the sound in the statistics line, pictures 0.4 s sooner at every start and seek, newest-first On Demand, PlayStation button shapes in every hint, and keeping whole lists when a provider sends oversized data.
+- **ThatGuyKalvin** ([GitHub](https://github.com/ThatGuyKalvin)), for the playback menu, channel list and controls drawn at the screen's resolution, DTS sound, lip sync timed by when each picture reaches the screen, the sound in the statistics line, pictures 0.4 s sooner at every start and seek, newest-first On Demand, PlayStation button shapes in every hint, keeping whole lists when a provider sends oversized data, seeking within the open video, the HDR colour fix, the Stats line switch, the Continue row of a show, long on-demand lists, the quicker On Demand menu, the TV remote and the film and show counts of a source.
 - **Cold** ([GitHub](https://github.com/JMUtechnologies)), for **Normalize channel volume**, which brings quiet and loud channels to a similar level.
+- **Oliv3rmoon** ([GitHub](https://github.com/Oliv3rmoon)), for listing a channel in every category its provider names.
 
 <!-- bbr-footer:start -->
 <!-- Generated by ps5-homebrew-dev-protocol/scripts/readme-footer. Edit the template there, not here. -->
@@ -590,14 +613,14 @@ Third-party components, authors and licenses are listed in
 
 ## License
 
-Copyright © 2026 BlackBearReloaded. Licensed under GPL-3.0-or-later; see [LICENSE](LICENSE). Third-party components keep their own licenses. Binary releases are built from the tagged source in this repository.
+Copyright © 2026 BlackBearReloaded and contributors. Licensed under GPL-3.0-or-later; see [LICENSE](LICENSE). The repository's move to ThatGuyKalvin changes no copyright or licence notice. Third-party components keep their own licenses. Binary releases are built from the tagged source in this repository.
 
 ## Disclaimer
 
 - **No affiliation.** This is an independent homebrew project. It is not
   affiliated with, endorsed by, or sponsored by Sony Interactive Entertainment.
   "PlayStation", "PS5" and related marks are trademarks of Sony Interactive
-  Entertainment Inc. This project is not affiliated with or endorsed by iptv-org.
+  Entertainment Inc.
 - **No proprietary material.** No Sony SDK, firmware, encryption keys or
   decrypted system modules are included.
 - **No warranty.** This project is provided "as is", without warranty of any

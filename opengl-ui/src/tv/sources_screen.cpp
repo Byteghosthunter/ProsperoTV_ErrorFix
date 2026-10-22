@@ -35,7 +35,7 @@ std::string account_date(std::int64_t stamp)
     return tr("Not supplied");
 }
 
-// A source with nothing to open yet; the built-in list has no address and needs none.
+// A source with nothing to open yet.
 bool needs_setup(const SavedSource *source)
 {
     return source != nullptr && source->url.empty() && source->kind != 0;
@@ -43,7 +43,7 @@ bool needs_setup(const SavedSource *source)
 
 const char *source_title(const SavedSource &source)
 {
-    static constexpr const char *defaults[] = {"iptv-org public catalog", "Custom playlist",
+    static constexpr const char *defaults[] = {"No source", "Custom playlist",
                                                "Xtream Codes account", "MAC-code portal"};
     if (source.id >= 1 && source.id <= 4 && source.kind == source.id - 1 &&
         source.name == defaults[source.id - 1])
@@ -76,11 +76,11 @@ void SourcesScreen::sync()
     ids_.clear();
     for (const auto &source : model.saved_sources())
     {
-        if (source.kind > 5)
+        // The first slot is no source at all: nothing to show or choose.
+        if (source.kind == 0 || source.kind > 5)
             continue;
         ui::ListItem row;
         row.title = source_title(source);
-        // The built-in list has no address of its own and nothing to set up.
         row.subtitle = needs_setup(&source) ? tr("Not set up") : tr(schedule_name(source.schedule));
         row.badge = source.id == model.selected_source_id() ? tr("In use") : "";
         if (source.kind == 2)
@@ -340,9 +340,8 @@ void SourcesScreen::draw(ui::Canvas &canvas) const
             left, 375, 26, width, 38, theme.text_muted, 6);
         return;
     }
-    const std::string address = source->kind == 0     ? tr("Built in")
-                                : source->url.empty() ? tr("Not set up")
-                                                      : redact_address(source->url);
+    const std::string address =
+        source->url.empty() ? tr("Not set up") : redact_address(source->url);
     ui::paragraph(draw, fonts.regular, address, left, 375, 24, width, 34, theme.text_muted, 3);
     const auto guide_url = model.guide_url_override(id);
     if (!guide_url.empty())
@@ -385,10 +384,20 @@ void SourcesScreen::draw(ui::Canvas &canvas) const
     }
     if (id == model.selected_source_id())
     {
-        ui::text(draw, fonts.semibold, group_digits(model.channel_count()) + tr(" channels"), left,
-                 735, 28, theme.text);
-        ui::paragraph(draw, fonts.regular, model.source_detail(), left, 785, 22, width, 31,
-                      theme.text_muted, 3);
+        const auto &counts = model.counts();
+        float y = 724;
+        const auto count = [&](const std::string &text)
+        {
+            ui::text(draw, fonts.semibold, text, left, y, 26, theme.text);
+            y += 32;
+        };
+        count(group_digits(counts.channels) + tr(" channels"));
+        if (counts.movies)
+            count(group_digits(*counts.movies) + tr(" movies"));
+        if (counts.shows)
+            count(group_digits(*counts.shows) + tr(" TV shows"));
+        ui::paragraph(draw, fonts.regular, model.source_detail(), left, y + 10, 22, width, 31,
+                      theme.text_muted, 2);
     }
     else
     {
