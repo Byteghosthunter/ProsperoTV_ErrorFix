@@ -1589,6 +1589,19 @@ void *IptvApp::RefreshThreadEntry(void *argument)
                 app->pending_fetch_ =
                     iptv::http::GetM3u(endpoint.c_str(), response.data(), response.size(),
                                        response.max_bytes, nullptr, &control);
+                // Debug only: the error body may contain private account information.
+                // Read it locally and redact it before sending to anybody.
+                if (app->pending_fetch_.http_status == 403 && action.empty())
+                {
+                    constexpr char kDebugPath[] = "/download0/prosperotv-xtream-403-body.txt";
+                    if (std::FILE *debug = std::fopen(kDebugPath, "wb"))
+                    {
+                        const std::size_t bytes = app->pending_fetch_.bytes < 2048u
+                                                      ? app->pending_fetch_.bytes : 2048u;
+                        (void)std::fwrite(response.data(), 1u, bytes, debug);
+                        (void)std::fclose(debug);
+                    }
+                }
                 return app->pending_fetch_.status == iptv::http::Status::ok &&
                        !app->shutdown_requested_.load(std::memory_order_acquire);
             };
